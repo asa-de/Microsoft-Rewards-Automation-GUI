@@ -153,27 +153,6 @@ class DashboardWidget(QtWidgets.QFrame):
         points_row.addWidget(self.lbl_today_points, 1)
         progress_layout.addLayout(points_row)
 
-        self.progress_today = QtWidgets.QProgressBar()
-        self.progress_today.setMinimum(0)
-        self.progress_today.setMaximum(100)
-        self.progress_today.setValue(0)
-        self.progress_today.setTextVisible(True)
-        self.progress_today.setStyleSheet("""
-            QProgressBar {
-                border: 1px solid #444;
-                border-radius: 5px;
-                background-color: #3d3d3d;
-                height: 20px;
-                text-align: center;
-                color: #e0e0e0;
-            }
-            QProgressBar::chunk {
-                background-color: #4285f4;
-                border-radius: 4px;
-            }
-        """)
-        progress_layout.addWidget(self.progress_today)
-
         layout.addWidget(progress_card)
         layout.addStretch()
     
@@ -222,8 +201,6 @@ class DashboardWidget(QtWidgets.QFrame):
         # 连续打卡来源
         streaks = data.get("streaks") or []
         by_id = {str(s.get("id")): s for s in streaks if isinstance(s, dict)}
-        goal_cur_sum = 0
-        goal_max_sum = 0
         for sid, (_name_lbl, day_lbl, goal_lbl) in self.streak_labels.items():
             s = by_id.get(sid) or {}
             day = s.get("day")
@@ -239,8 +216,6 @@ class DashboardWidget(QtWidgets.QFrame):
                 goal_lbl.setStyleSheet(
                     "color: #81c995; font-size: 12px;" if gcur >= gmax else "color: #8ab4f8; font-size: 12px;"
                 )
-                goal_cur_sum += max(0, gcur)
-                goal_max_sum += max(0, gmax)
             else:
                 goal_lbl.setText("--/--")
                 goal_lbl.setStyleSheet("color: #8ab4f8; font-size: 12px;")
@@ -248,17 +223,6 @@ class DashboardWidget(QtWidgets.QFrame):
         pc_cur = int(data.get("pc_current", 0) or 0)
         pc_max = int(data.get("pc_max", 0) or 0)
         self.lbl_today_points.setText(f"{pc_cur} / {pc_max}" if pc_max or pc_cur else "-- / --")
-
-        if isinstance(sc, int) and isinstance(st, int) and st > 0:
-            today_pct = int(sc / st * 100)
-        elif goal_max_sum > 0:
-            today_pct = int(goal_cur_sum / goal_max_sum * 100)
-        else:
-            task_cur = int(data.get("task_current", 0) or 0)
-            task_max = int(data.get("task_max", 0) or 0)
-            today_pct = int((task_cur / task_max * 100) if task_max > 0 else 0)
-        self.progress_today.setValue(today_pct)
-        self.progress_today.setFormat(f"{today_pct}%")
     
     def clear(self):
         """清空仪表盘"""
@@ -272,8 +236,6 @@ class DashboardWidget(QtWidgets.QFrame):
             goal_lbl.setText("--/--")
             goal_lbl.setStyleSheet("color: #8ab4f8; font-size: 12px;")
         self.lbl_today_points.setText("-- / --")
-        self.progress_today.setValue(0)
-        self.progress_today.setFormat("0%")
 
 
 class RewardsGUI(QtWidgets.QMainWindow):
@@ -349,7 +311,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
         self.cb_headless.setChecked(False)
         self.cb_daily = QtWidgets.QCheckBox("每日活动")
         self.cb_daily.setChecked(True)
-        self.cb_daily.setToolTip("自动完成首页「每日活动」+ 赚取页「日常任务」（仅对应分区内带积分卡片）；拼图类只需打开")
+        self.cb_daily.setToolTip("自动完成首页「每日任务/每日活动」+ 赚取页「日常任务」（仅对应分区内带积分卡片）；拼图类只需打开")
         self.cb_claim = QtWidgets.QCheckBox("自动领取")
         self.cb_claim.setChecked(True)
         self.cb_claim.setToolTip("自动点击仪表盘“可领取/领取”")
@@ -1297,14 +1259,16 @@ class RewardsGUI(QtWidgets.QMainWindow):
         # 1) 自动领取（活动前）
         if self.enable_auto_claim and not _should_stop():
             try:
-                await claim_available_rewards(page, log=_task_log, should_stop=_should_stop)
+                await claim_available_rewards(
+                    page, context=context, log=_task_log, should_stop=_should_stop
+                )
             except Exception as e:
                 self.log_signal.emit(f"{prefix}自动领取失败: {e}", "WARN")
 
         # 2) 每日活动
         if self.enable_daily_activities and not _should_stop():
             try:
-                await complete_daily_activities(
+                page, _ = await complete_daily_activities(
                     page,
                     context,
                     log=_task_log,
@@ -1312,6 +1276,12 @@ class RewardsGUI(QtWidgets.QMainWindow):
                 )
             except Exception as e:
                 self.log_signal.emit(f"{prefix}每日活动失败: {e}", "WARN")
+                try:
+                    pages = [p for p in context.pages if not p.is_closed()]
+                    if pages:
+                        page = pages[-1]
+                except Exception:
+                    pass
 
         # 3) 搜索任务（若仍有剩余）
         need_search = total > 0 and remaining > 0 and stats.get("max_points", 0) > 0
@@ -1442,7 +1412,9 @@ class RewardsGUI(QtWidgets.QMainWindow):
         # 4) 活动/搜索后再领取一次
         if self.enable_auto_claim and not _should_stop():
             try:
-                await claim_available_rewards(page, log=_task_log, should_stop=_should_stop)
+                await claim_available_rewards(
+                    page, context=context, log=_task_log, should_stop=_should_stop
+                )
             except Exception as e:
                 self.log_signal.emit(f"{prefix}结束领取失败: {e}", "WARN")
 

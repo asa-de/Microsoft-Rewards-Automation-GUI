@@ -1669,13 +1669,19 @@ async def run_rewards_auto_search(page, context, device_type: str):
 
     # 先领取 + 每日活动（即使搜索已完成也执行）
     try:
-        await claim_available_rewards(page, log=lambda m: print(m))
+        await claim_available_rewards(page, context=context, log=lambda m: print(m))
     except Exception as e:
         print(f"自动领取失败: {e}")
     try:
-        await complete_daily_activities(page, context, log=lambda m: print(m))
+        page, _ = await complete_daily_activities(page, context, log=lambda m: print(m))
     except Exception as e:
         print(f"每日活动失败: {e}")
+        try:
+            pages = [p for p in context.pages if not p.is_closed()]
+            if pages:
+                page = pages[-1]
+        except Exception:
+            pass
 
     _render_console_dashboard(
         _format_console_dashboard(
