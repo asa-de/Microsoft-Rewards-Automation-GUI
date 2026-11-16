@@ -28,12 +28,12 @@ from main import (
     _get_exe_dir,
     _get_bundle_dir,
     _format_console_dashboard,
-    MSEDGE_CHANNEL,
+    BROWSER_CHANNEL,
     DOMCONTENTLOADED,
 )
 
 # Playwright 异步 API（用于浏览器自动化）
-from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.async_api import async_playwright
 
 
 class DashboardWidget(QtWidgets.QFrame):
@@ -271,7 +271,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
         # 按钮区
         self.btn_refresh = QtWidgets.QPushButton("刷新账号")
         self.btn_add_account = QtWidgets.QPushButton("添加账号")
-        self.btn_add_account.setToolTip("登录后点击右上角头像自动保存")
+        self.btn_add_account.setToolTip("在弹出的浏览器中完成登录后自动保存")
         self.btn_delete_account = QtWidgets.QPushButton("删除账号")
         self.btn_start = QtWidgets.QPushButton("开始 (单账号)")
         self.btn_batch = QtWidgets.QPushButton("批量开始 (全部账号)")
@@ -381,54 +381,303 @@ class RewardsGUI(QtWidgets.QMainWindow):
             self._set_buttons_enabled(idle=True)
             self.refresh_accounts_signal.emit()
 
+    _AUTH_COOKIE_NAMES = {
+        "MSPAuth",
+        "MSPProf",
+        "RPSSecAuth",
+        "WLSSC",
+        "__Host-MSAAUTH",
+        "PPLState",
+        "NAP",
+        "_U",
+    }
+
+    def _is_login_host(self, url: str) -> bool:
+        return any(
+            host in (url or "")
+            for host in (
+                "login.live.com",
+                "login.microsoftonline.com",
+                "account.live.com",
+                "login.microsoft.com",
+            )
+        )
+
+    async def _active_pages(self, context, fallback_page):
+        pages = []
+        try:
+            pages = [p for p in context.pages if not p.is_closed()]
+        except Exception:
+            pages = []
+        if not pages and fallback_page is not None:
+            try:
+                if not fallback_page.is_closed():
+                    pages = [fallback_page]
+            except Exception:
+                pass
+        return pages
+
+    async def _has_auth_cookies(self, context) -> bool:
+        try:
+            cookies = await context.cookies()
+        except Exception:
+            return False
+        names = {c.get("name") for c in cookies}
+        return bool(names & self._AUTH_COOKIE_NAMES)
+
+    async def _userinfo_indicates_login(self, context) -> bool:
+        try:
+            userinfo = await fetch_rewards_userinfo(context, timeout_ms=8000)
+            dashboard = userinfo.get("dashboard") or userinfo
+            user_status = (dashboard or {}).get("userStatus") or {}
+            return (
+                user_status.get("availablePoints") is not None
+                or bool(user_status.get("isRewardsUser"))
+                or bool(userinfo.get("isRewardsUser"))
+                or bool(user_status.get("ePuid"))
+            )
+        except Exception:
+            return False
+
+    async def _page_looks_logged_in(self, page) -> bool:
+        try:
+            url = page.url or ""
+        except Exception:
+            return False
+        if self._is_login_host(url) or "rewards.bing.com" not in url:
+            return False
+        # 仍停在显式登录入口时不算完成
+        if "/signin" in url or "/auth/login" in url:
+            return False
+
+        checks = [
+            'html[data-role-name="RewardsPortal"]',
+            "#userPointsDetails",
+            ".c-heading-2",
+            "[data-bi-id='rewards-user-balance']",
+            "me-rewards-user-points",
+            "#balanceToolTipDiv",
+        ]
+        for sel in checks:
+            try:
+                if await page.query_selector(sel):
+                    return True
+            except Exception:
+                continue
+
+        try:
+            text = await page.evaluate("() => (document.body && document.body.innerText) || ''")
+            text = text or ""
+            if any(k in text for k in ("可用积分", "Available points", "点数", "Rewards")) and (
+                "登录" not in text[:80]
+            ):
+                # 粗略判断：页面正文已出现积分相关文案
+                if any(k in text for k in ("可用积分", "Available points", "每日任务", "Daily set")):
+                    return True
+        except Exception:
+            pass
+        return False
+
+    async def _is_rewards_logged_in(self, page, context) -> bool:
+        """综合 URL / DOM / Cookie / API 判断是否已登录。"""
+        if await self._userinfo_indicates_login(context):
+            return True
+        if await self._page_looks_logged_in(page):
+            return True
+        return False
+
+    async def _extract_account_name(self, page, context) -> str:
+        """尽量解析邮箱/账户名；失败则回退到时间戳名称。"""
+        account_selectors = [
+            "#mectrl_currentAccount_secondary",
+            "#mectrl_currentAccount_primary",
+            "#mectrl_name",
+            "[id*='mectrl_currentAccount']",
+            "div.mectrl_accountDetails span",
+        ]
+        avatar_triggers = [
+            "#mectrl_headerPicture",
+            "#mectrl_main_trigger",
+            "button#mectrl_main_trigger",
+            "#id_l",
+            "a#id_l",
+        ]
+
+        async def _read_from_selectors() -> Optional[str]:
+            email_candidate = None
+            text_candidate = None
+            for sel in account_selectors:
+                try:
+                    el = await page.query_selector(sel)
+                    if not el:
+                        continue
+                    text = (await el.text_content() or "").strip()
+                    if not text:
+                        continue
+                    if "@" in text:
+                        email_candidate = text
+                        break
+                    if not text_candidate:
+                        text_candidate = text
+                except Exception:
+                    continue
+            return email_candidate or text_candidate
+
+        name = await _read_from_selectors()
+        if name:
+            return name
+
+        for sel in avatar_triggers:
+            try:
+                el = await page.query_selector(sel)
+                if not el:
+                    continue
+                await el.click(timeout=1500)
+                await page.wait_for_timeout(800)
+                name = await _read_from_selectors()
+                if name:
+                    return name
+            except Exception:
+                continue
+
+        try:
+            userinfo = await fetch_rewards_userinfo(context, timeout_ms=8000)
+            for key in ("firstName", "name", "userName", "email"):
+                val = userinfo.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+            dashboard = userinfo.get("dashboard") or {}
+            user_status = dashboard.get("userStatus") or {}
+            for key in ("firstName", "name", "userName", "email"):
+                val = user_status.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+            epuid = user_status.get("ePuid")
+            if isinstance(epuid, str) and epuid.strip():
+                return f"user_{epuid[:8]}"
+        except Exception:
+            pass
+
+        return f"account_{time.strftime('%Y%m%d_%H%M%S')}"
+
     async def _add_account_async(self):
         """登录并保存cookie（异步版本）"""
         cookies_dir = _get_exe_dir() / "Assets" / "cookies"
         cookies_dir.mkdir(parents=True, exist_ok=True)
         
         async with async_playwright() as p:
-            browser = await p.chromium.launch(channel=MSEDGE_CHANNEL, headless=False)
+            browser = await p.chromium.launch(channel=BROWSER_CHANNEL, headless=False)
             context = await browser.new_context()
             page = await context.new_page()
             
             try:
                 self.log_signal.emit("正在打开 Bing Rewards 页面...", "INFO")
-                await page.goto("https://rewards.bing.com/?ref=rewardspanel")
+                await page.goto(
+                    "https://rewards.bing.com/",
+                    wait_until=DOMCONTENTLOADED,
+                    timeout=60000,
+                )
                 
-                self.log_signal.emit("请在浏览器中登录您的Microsoft账户...", "INFO")
-                
-                # 等待用户登录（检测登录成功）
-                try:
-                    # 等待账户元素出现或超时30分钟
-                    await page.wait_for_selector(
-                        "#mectrl_currentAccount_secondary",
-                        timeout=1800000
+                self.log_signal.emit(
+                    "请在弹出的 Chrome 中完成登录；看到 Rewards 主页后保持几秒，程序会自动保存",
+                    "INFO",
+                )
+
+                deadline = time.time() + 1800  # 30 分钟
+                logged_in = False
+                stable_since = None
+                last_status_log = 0.0
+                navigated_after_auth = False
+
+                while time.time() < deadline:
+                    pages = await self._active_pages(context, page)
+                    if not pages:
+                        self.log_signal.emit("浏览器窗口已关闭，添加账号已取消", "WARN")
+                        return
+
+                    # 优先检查所有标签页
+                    current = pages[-1]
+                    urls = []
+                    for pg in pages:
+                        try:
+                            urls.append(pg.url or "")
+                        except Exception:
+                            continue
+                    status_url = urls[-1] if urls else ""
+
+                    now = time.time()
+                    if now - last_status_log >= 8:
+                        self.log_signal.emit(f"等待登录中… 当前页面: {status_url or '(空白)'}", "INFO")
+                        last_status_log = now
+
+                    # 已有登录 Cookie 但还停在登录域/非 Rewards 时，主动拉回 Rewards
+                    if (
+                        not navigated_after_auth
+                        and await self._has_auth_cookies(context)
+                        and (self._is_login_host(status_url) or "rewards.bing.com" not in status_url)
+                    ):
+                        try:
+                            self.log_signal.emit("检测到登录 Cookie，正在跳转到 Rewards...", "INFO")
+                            await current.goto(
+                                "https://rewards.bing.com/",
+                                wait_until=DOMCONTENTLOADED,
+                                timeout=60000,
+                            )
+                            navigated_after_auth = True
+                            stable_since = None
+                        except Exception as e:
+                            self.log_signal.emit(f"跳转 Rewards 失败: {e}", "WARN")
+
+                    # 任一标签满足登录条件，或 Rewards 页面稳定停留
+                    ok = False
+                    for pg in pages:
+                        if await self._is_rewards_logged_in(pg, context):
+                            current = pg
+                            ok = True
+                            break
+
+                    on_rewards = any(
+                        ("rewards.bing.com" in u)
+                        and ("/signin" not in u)
+                        and ("/auth/login" not in u)
+                        and (not self._is_login_host(u))
+                        for u in urls
                     )
-                except PlaywrightTimeoutError:
+                    if on_rewards and await self._has_auth_cookies(context):
+                        if stable_since is None:
+                            stable_since = now
+                        elif now - stable_since >= 5:
+                            ok = True
+                    else:
+                        stable_since = None
+
+                    if ok:
+                        page = current
+                        logged_in = True
+                        break
+
+                    await asyncio.sleep(1.5)
+
+                if not logged_in:
                     self.log_signal.emit("登录超时或已取消", "WARN")
                     return
-                
-                # 获取账户名
-                account_name = None
+
+                self.log_signal.emit("已检测到登录态，正在保存 Cookie...", "INFO")
+                # 确保落在 Rewards 域再取 Cookie/账户名
                 try:
-                    account_element = await page.query_selector("#mectrl_currentAccount_secondary")
-                    if account_element:
-                        text = await account_element.text_content()
-                        if text and text.strip():
-                            account_name = text.strip()
+                    if "rewards.bing.com" not in (page.url or ""):
+                        await page.goto(
+                            "https://rewards.bing.com/",
+                            wait_until=DOMCONTENTLOADED,
+                            timeout=60000,
+                        )
                 except Exception:
                     pass
-                
-                if not account_name:
-                    account_name = "未知账户"
-                    
-                account_name = _sanitize_filename(account_name)
-                
+
+                account_name = _sanitize_filename(await self._extract_account_name(page, context))
                 cookies = await context.cookies()
                 cookie_file = cookies_dir / f"{account_name}.json"
-                
                 cookie_file.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
-                
                 self.log_signal.emit(f"Cookie已保存: {account_name}", "SUCCESS")
                 
             except Exception as e:
@@ -744,7 +993,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
         user_agent = ua_value() if callable(ua_value) else ua_value
         self.log_signal.emit(f"{prefix}启动浏览器，设备: {device_type}", "INFO")
         async with async_playwright() as p:
-            launch_kwargs = {"channel": MSEDGE_CHANNEL, "headless": self.headless_mode}
+            launch_kwargs = {"channel": BROWSER_CHANNEL, "headless": self.headless_mode}
             browser = await p.chromium.launch(**launch_kwargs)
             ctx_kwargs = self._context_kwargs(p, device_type, user_agent)
             context = await browser.new_context(**ctx_kwargs)

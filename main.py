@@ -10,7 +10,7 @@ from urllib.parse import quote_plus
 from playwright.async_api import async_playwright
 
 # 常量：集中管理字符串，避免拼写检查对字符串字面量误报
-MSEDGE_CHANNEL = "msedge"
+BROWSER_CHANNEL = "chrome"
 DOMCONTENTLOADED = "domcontentloaded"
 
 # 记录程序启动时间，用于展示运行时长
@@ -934,7 +934,7 @@ async def login_and_save():
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            channel=MSEDGE_CHANNEL,
+            channel=BROWSER_CHANNEL,
             headless=False
         )
         
@@ -943,7 +943,11 @@ async def login_and_save():
         
         try:
             print("正在打开 Bing Rewards 页面...")
-            await page.goto("https://rewards.bing.com/?ref=rewardspanel")
+            await page.goto(
+                "https://rewards.bing.com/?ref=rewardspanel",
+                wait_until=DOMCONTENTLOADED,
+                timeout=60000,
+            )
             
             print("\n请在浏览器中登录您的Microsoft账户...")
             print("登录完成后，按回车键保存Cookie...")
@@ -1033,7 +1037,7 @@ async def use_saved_cookie():
     
     async with async_playwright() as p:
         browser = await p.chromium.launch(
-            channel="msedge",
+            channel=BROWSER_CHANNEL,
             headless=False
         )
         
