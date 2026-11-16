@@ -6,6 +6,7 @@ import re
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 from urllib.parse import quote_plus
 
 from playwright.async_api import async_playwright
@@ -426,6 +427,95 @@ def load_auth_state(path: Path) -> dict:
     raise ValueError(f"无法识别的会话文件格式: {path}")
 
 
+def read_account_meta(path: Path) -> dict:
+    """读取会话文件中的账号元数据（若有）。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    if isinstance(data, dict) and isinstance(data.get("_account"), dict):
+        return dict(data["_account"])
+    return {}
+
+
+def cookie_identity_key(cookies: list) -> Optional[str]:
+    """从 Cookie 生成稳定账号指纹，用于去重。"""
+    by_name: dict[str, str] = {}
+    for c in cookies or []:
+        if not isinstance(c, dict):
+            continue
+        name = c.get("name")
+        value = c.get("value")
+        if isinstance(name, str) and isinstance(value, str) and value:
+            by_name[name] = value
+
+    anon = by_name.get("ANON") or ""
+    m = re.search(r"(?:^|&)A=([^&]+)", anon)
+    if m and m.group(1):
+        return f"anon:{m.group(1)}"
+
+    for key in ("MSPAuth", "RPSSecAuth", "__Host-MSAAUTH"):
+        val = by_name.get(key) or ""
+        if val and val.lower() != "disabled" and len(val) >= 12:
+            return f"{key.lower()}:{val[:48]}"
+    return None
+
+
+def account_identity_from_file(path: Path) -> Optional[str]:
+    """读取已有会话文件的稳定账号指纹。"""
+    meta = read_account_meta(path)
+    key = meta.get("key")
+    if isinstance(key, str) and key.strip():
+        return key.strip()
+    try:
+        state = load_auth_state(path)
+        return cookie_identity_key(state.get("cookies") or [])
+    except Exception:
+        return None
+
+
+def find_account_files_by_identity(cookies_dir: Path, identity_key: str) -> list[Path]:
+    """找出同一账号指纹的所有会话文件。"""
+    if not identity_key:
+        return []
+    matches: list[Path] = []
+    for p in sorted(Path(cookies_dir).glob("*.json")):
+        try:
+            if account_identity_from_file(p) == identity_key:
+                matches.append(p)
+        except Exception:
+            continue
+    return matches
+
+
+def dedupe_account_files(cookies_dir: Path) -> list[tuple[Path, list[Path]]]:
+    """扫描目录，按账号指纹去重：保留最新文件，删除其余副本。"""
+    cookies_dir = Path(cookies_dir)
+    groups: dict[str, list[Path]] = {}
+    for p in sorted(cookies_dir.glob("*.json")):
+        key = account_identity_from_file(p)
+        if not key:
+            continue
+        groups.setdefault(key, []).append(p)
+
+    results: list[tuple[Path, list[Path]]] = []
+    for key, files in groups.items():
+        if len(files) <= 1:
+            continue
+        files_sorted = sorted(files, key=lambda x: x.stat().st_mtime, reverse=True)
+        keep = files_sorted[0]
+        removed: list[Path] = []
+        for p in files_sorted[1:]:
+            try:
+                p.unlink()
+                removed.append(p)
+            except Exception:
+                continue
+        if removed:
+            results.append((keep, removed))
+    return results
+
+
 async def apply_auth_state(context, path: Path) -> None:
     """把会话文件注入到已有 BrowserContext。"""
     state = load_auth_state(path)
@@ -434,15 +524,148 @@ async def apply_auth_state(context, path: Path) -> None:
         await context.add_cookies(cookies)
 
 
-async def save_auth_state(context, path: Path) -> None:
+async def save_auth_state(context, path: Path, account: dict | None = None) -> None:
     """保存完整 storage_state（cookies + origins）。
 
-    落盘保持 Playwright 原始格式；加载时再做兼容规范化。
+    落盘保持 Playwright 原始格式，并可选写入 `_account` 元数据；加载时会忽略该字段。
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     state = await context.storage_state()
+    if account:
+        state["_account"] = {
+            "name": account.get("name"),
+            "key": account.get("key"),
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
     path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+async def resolve_account_identity(page, context) -> dict:
+    """解析展示名 + 稳定去重 key。
+
+    优先邮箱；其次页面名；再退到 Cookie 指纹。不再默认用纯时间戳做主名，避免同账号多条。
+    """
+    display_name = None
+    email = None
+
+    # 1) 页面可见邮箱/文案
+    try:
+        scraped = await page.evaluate(
+            """() => {
+              const body = (document.body && document.body.innerText) || '';
+              const html = document.documentElement ? document.documentElement.innerHTML : '';
+              const emailRe = /[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/ig;
+              const emails = [];
+              for (const src of [body, html]) {
+                const found = src.match(emailRe) || [];
+                for (const e of found) {
+                  const low = e.toLowerCase();
+                  if (low.endsWith('.png') || low.endsWith('.jpg') || low.endsWith('.js')) continue;
+                  if (!emails.includes(low)) emails.push(low);
+                }
+              }
+              return { emails, title: document.title || '' };
+            }"""
+        )
+        emails = scraped.get("emails") or []
+        if emails:
+            email = str(emails[0]).strip()
+            display_name = email
+    except Exception:
+        pass
+
+    # 2) 旧版 Me Control
+    if not display_name:
+        for sel in (
+            "#mectrl_currentAccount_secondary",
+            "#mectrl_currentAccount_primary",
+            "#mectrl_name",
+        ):
+            try:
+                el = await page.query_selector(sel)
+                if not el:
+                    continue
+                text = (await el.text_content() or "").strip()
+                if text:
+                    display_name = text
+                    if "@" in text:
+                        email = text
+                    break
+            except Exception:
+                continue
+
+    # 3) Cookie 指纹（稳定去重）
+    try:
+        cookies = await context.cookies()
+    except Exception:
+        cookies = []
+    identity_key = None
+    if email:
+        identity_key = f"email:{email.lower()}"
+    if not identity_key:
+        identity_key = cookie_identity_key(cookies)
+
+    if not display_name and identity_key:
+        if identity_key.startswith("anon:"):
+            display_name = f"user_{identity_key.split(':', 1)[1][:8]}"
+        else:
+            display_name = f"user_{identity_key.split(':', 1)[-1][:8]}"
+
+    if not display_name:
+        display_name = f"account_{time.strftime('%Y%m%d_%H%M%S')}"
+    if not identity_key:
+        # 最后兜底：用展示名，至少同名会覆盖
+        identity_key = f"name:{display_name.lower()}"
+
+    return {
+        "name": _sanitize_filename(display_name),
+        "key": identity_key,
+        "email": email,
+    }
+
+
+async def save_account_session(context, cookies_dir: Path, account: dict) -> tuple[Path, list[Path]]:
+    """按账号指纹去重保存：覆盖已有文件，并删除同账号的其它副本。"""
+    cookies_dir = Path(cookies_dir)
+    cookies_dir.mkdir(parents=True, exist_ok=True)
+
+    name = _sanitize_filename(account.get("name") or "account")
+    key = account.get("key") or f"name:{name.lower()}"
+    preferred = cookies_dir / f"{name}.json"
+
+    matches = find_account_files_by_identity(cookies_dir, key)
+    # 也把同名文件算进去（即使还没有写入 key）
+    if preferred.exists() and preferred not in matches:
+        matches.append(preferred)
+
+    target = preferred
+    if matches:
+        # 优先覆盖已有同名；否则覆盖最早那个，再改名为新展示名
+        same_name = [p for p in matches if p.name.lower() == preferred.name.lower()]
+        target = same_name[0] if same_name else matches[0]
+
+    # 若目标文件名不是期望展示名，且期望名未被其它账号占用，则改用期望名
+    if target.resolve() != preferred.resolve():
+        other_key = account_identity_from_file(preferred) if preferred.exists() else None
+        if (not preferred.exists()) or other_key in (None, key):
+            target = preferred
+
+    await save_auth_state(context, target, account={"name": name, "key": key})
+
+    removed: list[Path] = []
+    for p in find_account_files_by_identity(cookies_dir, key):
+        if p.resolve() == target.resolve():
+            continue
+        try:
+            p.unlink()
+            removed.append(p)
+        except Exception:
+            continue
+
+    # 同名但指纹读不到的旧时间戳文件：若内容 identity 对得上已处理；
+    # 额外清理：保存后若 preferred 之外仍有同 key，上面已删。
+    return target, removed
 
 
 async def fetch_rewards_userinfo(context, *, timeout_ms: int = 15000, page=None):
@@ -1274,18 +1497,18 @@ async def login_and_save():
                 account_name = "未知账户"
                 print("\n警告: 未能检测到账户名，使用默认名称")
 
-            account_name = _sanitize_filename(account_name)
-
-            # 保存前确认 Rewards API 可用，避免写入半成品会话
+            # 保存前确认 Rewards API/页面抓取可用，避免写入半成品会话
             try:
                 await fetch_rewards_userinfo(context, timeout_ms=20000, page=page)
             except Exception as e:
                 print(f"\n错误: Rewards API 不可用，未保存会话: {e}")
                 return
 
-            cookie_file = cookies_dir / f"{account_name}.json"
-            await save_auth_state(context, cookie_file)
+            account = await resolve_account_identity(page, context)
+            cookie_file, removed = await save_account_session(context, cookies_dir, account)
             print(f"会话已保存到: {cookie_file}")
+            if removed:
+                print("已删除同账号重复文件:", ", ".join(p.name for p in removed))
             await asyncio.sleep(1)
             
         except Exception as e:

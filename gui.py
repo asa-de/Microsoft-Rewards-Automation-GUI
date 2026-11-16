@@ -24,14 +24,16 @@ from main import (
     _maybe_human_scroll,
     _maybe_click_one_result,
     get_cookie_files,
-    _sanitize_filename,
     _get_exe_dir,
     _get_bundle_dir,
     _format_console_dashboard,
     BROWSER_CHANNEL,
     DOMCONTENTLOADED,
     load_auth_state,
-    save_auth_state,
+    resolve_account_identity,
+    save_account_session,
+    dedupe_account_files,
+    read_account_meta,
 )
 
 # Playwright 异步 API（用于浏览器自动化）
@@ -502,80 +504,6 @@ class RewardsGUI(QtWidgets.QMainWindow):
             return True
         return False
 
-    async def _extract_account_name(self, page, context) -> str:
-        """尽量解析邮箱/账户名；失败则回退到时间戳名称。"""
-        account_selectors = [
-            "#mectrl_currentAccount_secondary",
-            "#mectrl_currentAccount_primary",
-            "#mectrl_name",
-            "[id*='mectrl_currentAccount']",
-            "div.mectrl_accountDetails span",
-        ]
-        avatar_triggers = [
-            "#mectrl_headerPicture",
-            "#mectrl_main_trigger",
-            "button#mectrl_main_trigger",
-            "#id_l",
-            "a#id_l",
-        ]
-
-        async def _read_from_selectors() -> Optional[str]:
-            email_candidate = None
-            text_candidate = None
-            for sel in account_selectors:
-                try:
-                    el = await page.query_selector(sel)
-                    if not el:
-                        continue
-                    text = (await el.text_content() or "").strip()
-                    if not text:
-                        continue
-                    if "@" in text:
-                        email_candidate = text
-                        break
-                    if not text_candidate:
-                        text_candidate = text
-                except Exception:
-                    continue
-            return email_candidate or text_candidate
-
-        name = await _read_from_selectors()
-        if name:
-            return name
-
-        for sel in avatar_triggers:
-            try:
-                el = await page.query_selector(sel)
-                if not el:
-                    continue
-                await el.click(timeout=1500)
-                await page.wait_for_timeout(800)
-                name = await _read_from_selectors()
-                if name:
-                    return name
-            except Exception:
-                continue
-
-        try:
-            userinfo = await fetch_rewards_userinfo(context, timeout_ms=8000)
-            for key in ("firstName", "name", "userName", "email"):
-                val = userinfo.get(key)
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-            dashboard = userinfo.get("dashboard") or {}
-            user_status = dashboard.get("userStatus") or {}
-            for key in ("firstName", "name", "userName", "email"):
-                val = user_status.get(key)
-                if isinstance(val, str) and val.strip():
-                    return val.strip()
-            epuid = user_status.get("ePuid")
-            if isinstance(epuid, str) and epuid.strip():
-                return f"user_{epuid[:8]}"
-        except Exception:
-            pass
-
-        return f"account_{time.strftime('%Y%m%d_%H%M%S')}"
-
     async def _add_account_async(self):
         """登录并保存cookie（异步版本）"""
         cookies_dir = _get_exe_dir() / "Assets" / "cookies"
@@ -694,10 +622,13 @@ class RewardsGUI(QtWidgets.QMainWindow):
                 except Exception:
                     pass
 
-                account_name = _sanitize_filename(await self._extract_account_name(page, context))
-                cookie_file = cookies_dir / f"{account_name}.json"
-                await save_auth_state(context, cookie_file)
+                account = await resolve_account_identity(page, context)
+                cookie_file, removed = await save_account_session(context, cookies_dir, account)
+                account_name = cookie_file.stem
                 self.log_signal.emit(f"会话已保存: {account_name}", "SUCCESS")
+                if removed:
+                    names = ", ".join(p.stem for p in removed)
+                    self.log_signal.emit(f"已合并同账号重复项: {names}", "INFO")
                 self._prefer_account_on_refresh = account_name
 
                 # 面板数据尽量刷新；失败也不回滚已保存的 Cookie
@@ -735,8 +666,8 @@ class RewardsGUI(QtWidgets.QMainWindow):
             self.log_signal.emit("请先选择要删除的账号", "WARN")
             return
 
-        account = item.text()
         cookie_path = Path(item.data(QtCore.Qt.ItemDataRole.UserRole))
+        account = cookie_path.stem
 
         # 若有运行中的任务，先提醒并尝试停止
         running = [k for k in list(self.running_tasks.keys()) if k.startswith(account + "_")]
@@ -805,6 +736,18 @@ class RewardsGUI(QtWidgets.QMainWindow):
         if prev:
             self.dashboard_texts.pop(prev, None)
             self._dashboard_fetching.discard(prev)
+
+        # 启动/刷新时顺带清理历史重复账号文件
+        try:
+            deduped = dedupe_account_files(_get_exe_dir() / "Assets" / "cookies")
+            for keep, removed in deduped:
+                self.log_signal.emit(
+                    f"已去重账号 {keep.stem}，删除重复: {', '.join(p.stem for p in removed)}",
+                    "INFO",
+                )
+        except Exception:
+            pass
+
         self.accounts_list.clear()
         try:
             # 与原始逻辑保持一致：内部自动从可写目录/资源目录查找
@@ -814,30 +757,34 @@ class RewardsGUI(QtWidgets.QMainWindow):
         selected_row = 0
         for idx, f in enumerate(files):
             # 统一计算/同步状态
+            meta = read_account_meta(f)
+            label = str(meta.get("name") or f.stem)
             self._recompute_account_status(f.stem)
             status = self.account_status.get(f.stem) or "空闲"
 
-            label = f.stem
             item = QtWidgets.QListWidgetItem(label)
             item.setData(QtCore.Qt.ItemDataRole.UserRole, str(f))
+            item.setData(QtCore.Qt.ItemDataRole.UserRole + 1, f.stem)
             # 状态文本
-            if status:
-                item.setToolTip(status)
+            tip = status
+            key = meta.get("key")
+            if key:
+                tip = f"{status}\n{key}"
+            if tip:
+                item.setToolTip(str(tip))
                 # 运行中使用轻微绿色高亮
                 if "运行中" in status:
                     item.setForeground(QtGui.QBrush(QtGui.QColor("#2e7d32")))
             self.accounts_list.addItem(item)
-            if prev and f.stem == prev:
+            if prev and (f.stem == prev or label == prev):
                 selected_row = idx
 
         if self.accounts_list.count() > 0:
             self.accounts_list.setCurrentRow(selected_row)
             item = self.accounts_list.currentItem()
             if item:
-                self._ensure_dashboard_for_account(
-                    item.text(),
-                    Path(item.data(QtCore.Qt.ItemDataRole.UserRole)),
-                )
+                cookie_path = Path(item.data(QtCore.Qt.ItemDataRole.UserRole))
+                self._ensure_dashboard_for_account(cookie_path.stem, cookie_path)
 
     # endregion
 
@@ -866,7 +813,13 @@ class RewardsGUI(QtWidgets.QMainWindow):
 
     def _current_selected_account(self) -> Optional[str]:
         item = self.accounts_list.currentItem()
-        return item.text() if item else None
+        if not item:
+            return None
+        stem = item.data(QtCore.Qt.ItemDataRole.UserRole + 1)
+        if stem:
+            return str(stem)
+        path = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        return Path(path).stem if path else item.text()
 
     def _update_dashboard_data(self, data: dict, account_name: Optional[str] = None):
         # 记录每个账号对应的仪表盘数据
@@ -892,7 +845,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
         if not current:
             return
         cookie_path = Path(current.data(QtCore.Qt.ItemDataRole.UserRole))
-        self._ensure_dashboard_for_account(current.text(), cookie_path)
+        self._ensure_dashboard_for_account(cookie_path.stem, cookie_path)
 
     def _ensure_dashboard_for_account(self, account_name: str, cookie_path: Path):
         """选中账号后若还没有面板数据，则后台拉取一次 Rewards 信息。"""
