@@ -1,3 +1,5 @@
 {
-  "headless": true
+  "headless": true,
+  "daily_activities": true,
+  "auto_claim": true
 }

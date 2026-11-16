@@ -35,6 +35,7 @@ from main import (
     dedupe_account_files,
     read_account_meta,
 )
+from activities import claim_available_rewards, complete_daily_activities
 
 # Playwright 异步 API（用于浏览器自动化）
 from playwright.async_api import async_playwright
@@ -96,24 +97,35 @@ class DashboardWidget(QtWidgets.QFrame):
         account_layout.setColumnStretch(3, 1)
         layout.addWidget(account_card)
         
-        # 今日进度卡片
+        # 今日进度卡片：任务 + 积分
         progress_card = self._create_card()
         progress_layout = QtWidgets.QVBoxLayout(progress_card)
         progress_layout.setContentsMargins(10, 10, 10, 10)
         progress_layout.setSpacing(8)
-        
-        # 今日获取标题
-        today_header = QtWidgets.QHBoxLayout()
-        lbl_today_title = QtWidgets.QLabel("今日获取")
-        lbl_today_title.setStyleSheet("font-weight: bold; font-size: 13px; color: #e0e0e0;")
+
+        stats_row = QtWidgets.QGridLayout()
+        stats_row.setHorizontalSpacing(12)
+        stats_row.setVerticalSpacing(6)
+
+        lbl_task_title = QtWidgets.QLabel("任务:")
+        lbl_task_title.setStyleSheet("font-weight: bold; color: #e0e0e0;")
+        self.lbl_tasks = QtWidgets.QLabel("-- / --")
+        self.lbl_tasks.setStyleSheet("font-size: 13px; color: #aaa;")
+
+        lbl_points_today_title = QtWidgets.QLabel("积分:")
+        lbl_points_today_title.setStyleSheet("font-weight: bold; color: #e0e0e0;")
         self.lbl_today_points = QtWidgets.QLabel("-- / --")
         self.lbl_today_points.setStyleSheet("font-size: 13px; color: #aaa;")
-        today_header.addWidget(lbl_today_title)
-        today_header.addStretch()
-        today_header.addWidget(self.lbl_today_points)
-        progress_layout.addLayout(today_header)
-        
-        # 今日进度条
+
+        stats_row.addWidget(lbl_task_title, 0, 0)
+        stats_row.addWidget(self.lbl_tasks, 0, 1)
+        stats_row.addWidget(lbl_points_today_title, 0, 2)
+        stats_row.addWidget(self.lbl_today_points, 0, 3)
+        stats_row.setColumnStretch(1, 1)
+        stats_row.setColumnStretch(3, 1)
+        progress_layout.addLayout(stats_row)
+
+        # 任务进度条
         self.progress_today = QtWidgets.QProgressBar()
         self.progress_today.setMinimum(0)
         self.progress_today.setMaximum(100)
@@ -134,7 +146,7 @@ class DashboardWidget(QtWidgets.QFrame):
             }
         """)
         progress_layout.addWidget(self.progress_today)
-        
+
         layout.addWidget(progress_card)
         
         # 状态卡片
@@ -177,14 +189,16 @@ class DashboardWidget(QtWidgets.QFrame):
         self.lbl_level.setText(data.get('level', '--'))
         self.lbl_points.setText(str(data.get('total_points', '--')))
         
-        # 今日进度
-        pc_cur = data.get('pc_current', 0)
-        pc_max = data.get('pc_max', 0)
-        today_cur = pc_cur
-        today_max = pc_max
-        
-        self.lbl_today_points.setText(f"{today_cur} / {today_max}")
-        today_pct = int((today_cur / today_max * 100) if today_max > 0 else 0)
+        # 任务 / 积分
+        task_cur = int(data.get("task_current", 0) or 0)
+        task_max = int(data.get("task_max", 0) or 0)
+        pc_cur = int(data.get("pc_current", 0) or 0)
+        pc_max = int(data.get("pc_max", 0) or 0)
+
+        self.lbl_tasks.setText(f"{task_cur} / {task_max}" if task_max or task_cur else "-- / --")
+        self.lbl_today_points.setText(f"{pc_cur} / {pc_max}" if pc_max or pc_cur else "-- / --")
+
+        today_pct = int((task_cur / task_max * 100) if task_max > 0 else 0)
         self.progress_today.setValue(today_pct)
         self.progress_today.setFormat(f"{today_pct}%")
         
@@ -197,6 +211,7 @@ class DashboardWidget(QtWidgets.QFrame):
         self.lbl_time.setText("当前时间: --:--:--")
         self.lbl_level.setText("--")
         self.lbl_points.setText("--")
+        self.lbl_tasks.setText("-- / --")
         self.lbl_today_points.setText("-- / --")
         self.progress_today.setValue(0)
         self.progress_today.setFormat("0%")
@@ -244,6 +259,8 @@ class RewardsGUI(QtWidgets.QMainWindow):
         self.cookies_dir = Path("Assets/cookies")
         # old GUI 默认非无头运行，这里与旧版保持一致
         self.headless_mode = False
+        self.enable_daily_activities = True
+        self.enable_auto_claim = True
 
         # 选中账号
         self.selected_cookie: Optional[Path] = None
@@ -272,7 +289,15 @@ class RewardsGUI(QtWidgets.QMainWindow):
         self.cb_headless = QtWidgets.QCheckBox("后台模式")
         # 默认关闭无头模式，与旧版保持一致；加载配置后会覆盖
         self.cb_headless.setChecked(False)
+        self.cb_daily = QtWidgets.QCheckBox("每日活动")
+        self.cb_daily.setChecked(True)
+        self.cb_daily.setToolTip("自动完成赚取页上的每日/探索类活动（含可跳过拼图）")
+        self.cb_claim = QtWidgets.QCheckBox("自动领取")
+        self.cb_claim.setChecked(True)
+        self.cb_claim.setToolTip("自动点击仪表盘“可领取/领取”")
         opts.addWidget(self.cb_headless)
+        opts.addWidget(self.cb_daily)
+        opts.addWidget(self.cb_claim)
         opts.addStretch(1)
 
         # 按钮区
@@ -356,6 +381,8 @@ class RewardsGUI(QtWidgets.QMainWindow):
         
         # UI 控件事件
         self.cb_headless.toggled.connect(self._on_headless_changed)
+        self.cb_daily.toggled.connect(self._on_task_options_changed)
+        self.cb_claim.toggled.connect(self._on_task_options_changed)
         self.btn_refresh.clicked.connect(self.refresh_accounts)
         self.btn_add_account.clicked.connect(self.add_account)
         self.btn_delete_account.clicked.connect(self.delete_account)
@@ -713,6 +740,10 @@ class RewardsGUI(QtWidgets.QMainWindow):
                 cfg = json.loads(self.config_path.read_text(encoding="utf-8"))
                 self.headless_mode = bool(cfg.get("headless", True))
                 self.cb_headless.setChecked(self.headless_mode)
+                self.enable_daily_activities = bool(cfg.get("daily_activities", True))
+                self.enable_auto_claim = bool(cfg.get("auto_claim", True))
+                self.cb_daily.setChecked(self.enable_daily_activities)
+                self.cb_claim.setChecked(self.enable_auto_claim)
         except Exception as e:
             self.log_signal.emit(f"读取配置失败: {e}", "ERROR")
 
@@ -721,6 +752,8 @@ class RewardsGUI(QtWidgets.QMainWindow):
             self.config_path.parent.mkdir(parents=True, exist_ok=True)
             cfg = {
                 "headless": self.headless_mode,
+                "daily_activities": self.enable_daily_activities,
+                "auto_claim": self.enable_auto_claim,
             }
             self.config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
@@ -923,6 +956,8 @@ class RewardsGUI(QtWidgets.QMainWindow):
             "total_points": 0,
             "pc_current": 0,
             "pc_max": 0,
+            "task_current": 0,
+            "task_max": 0,
             "status": status_text or "等待中...",
         }
         
@@ -938,9 +973,25 @@ class RewardsGUI(QtWidgets.QMainWindow):
             )
             data["total_points"] = int(user_status.get("availablePoints") or 0)
         
-        if stats:
-            data["pc_current"] = stats.get("pc", {}).get("current", 0)
-            data["pc_max"] = stats.get("pc", {}).get("max", 0)
+        # 优先使用页面抓取的综合进度（搜索 + 每日活动 + 今日积分/可领取）
+        progress = safe_userinfo.get("_progress") if isinstance(safe_userinfo, dict) else None
+        if isinstance(progress, dict):
+            data["task_current"] = int(progress.get("task_current", 0) or 0)
+            data["task_max"] = int(progress.get("task_max", 0) or 0)
+            data["pc_current"] = int(progress.get("points_current", 0) or 0)
+            data["pc_max"] = int(progress.get("points_max", 0) or 0)
+        elif stats:
+            data["pc_current"] = int(stats.get("pc", {}).get("current", 0) or 0)
+            data["pc_max"] = int(stats.get("pc", {}).get("max", 0) or 0)
+            total_searches = int(stats.get("total_searches", 0) or 0)
+            remaining = int(stats.get("remaining_searches", 0) or 0)
+            if total_searches > 0:
+                data["task_current"] = max(0, total_searches - remaining)
+                data["task_max"] = total_searches
+            else:
+                pps = int(SEARCH_CONFIG.get("points_per_search") or 3)
+                data["task_max"] = (data["pc_max"] + pps - 1) // pps if pps > 0 else 0
+                data["task_current"] = (data["pc_current"] + pps - 1) // pps if pps > 0 else 0
 
         self.dashboard_signal.emit(data, account_name)
 
@@ -1104,11 +1155,19 @@ class RewardsGUI(QtWidgets.QMainWindow):
         prefix = f"[{account_name}] " if account_name else ""
         self.log_signal.emit(f"{prefix}正在获取 Rewards 信息...", "INFO")
         try:
-            userinfo = await fetch_rewards_userinfo(context)
+            userinfo = await fetch_rewards_userinfo(context, page=page)
             stats = compute_remaining_searches(userinfo, device_type)
         except Exception as e:
-            self.log_signal.emit(f"{prefix}无法获取 Rewards 数据: {e}", "ERROR")
-            return
+            self.log_signal.emit(f"{prefix}无法获取 Rewards 数据: {e}", "WARN")
+            userinfo = None
+            stats = {
+                "remaining_searches": 0,
+                "total_searches": 0,
+                "device_label": "PC" if device_type == "windows" else "Mobile",
+                "max_points": 0,
+                "current_points": 0,
+                "pc": {"current": 0, "max": 0},
+            }
 
         remaining = stats["remaining_searches"]
         total = stats["total_searches"]
@@ -1127,139 +1186,163 @@ class RewardsGUI(QtWidgets.QMainWindow):
         # 启动周期性真实数据刷新任务（仅更新显示）
         refresh_task = asyncio.create_task(self._periodic_dashboard_refresh(context, device_type, account_name, task_name, interval=0.1))
 
-        # 检查当前设备是否需要执行任务
-        if total <= 0 or remaining <= 0:
-            self.log_signal.emit(f"{prefix}当前设备任务已完成或无需执行！", "SUCCESS")
-            self._render_dashboard(account_name=account_name, userinfo=userinfo, stats=stats, status_text="剩余 0 次", search_index=None, search_total=None)
+        def _should_stop() -> bool:
+            return self._should_stop(task_name, account_name)
+
+        def _task_log(msg: str) -> None:
+            self.log_signal.emit(f"{prefix}{msg}", "INFO")
+
+        # 1) 自动领取（活动前）
+        if self.enable_auto_claim and not _should_stop():
             try:
-                refresh_task.cancel()
-            except Exception:
-                pass
-            return
+                await claim_available_rewards(page, log=_task_log, should_stop=_should_stop)
+            except Exception as e:
+                self.log_signal.emit(f"{prefix}自动领取失败: {e}", "WARN")
 
-        if stats["max_points"] <= 0:
-            self.log_signal.emit(f"{prefix}今日任务已完成！", "SUCCESS")
-            self._render_dashboard(account_name=account_name, userinfo=userinfo, stats=stats, status_text="剩余 0 次", search_index=None, search_total=None)
+        # 2) 每日活动
+        if self.enable_daily_activities and not _should_stop():
             try:
-                refresh_task.cancel()
-            except Exception:
-                pass
-            return
-
-        delay_cfg = SEARCH_CONFIG["pc"] if device_type == "windows" else SEARCH_CONFIG["mobile"]
-        min_ms = delay_cfg["min_delay_ms"]
-        max_ms = delay_cfg["max_delay_ms"]
-
-        if page.url == "about:blank":
-            await page.goto("https://www.bing.com", wait_until=DOMCONTENTLOADED)
-        await asyncio.sleep(2)
-
-        # 使用实时剩余次数动态计算循环次数，避免因初始估计误差导致提前结束
-        current_remaining = remaining
-        executed = 0
-        # 保险上限，防止意外无限循环（通常 total 就是每天的最大搜索次数）
-        safety_cap = max(total, remaining, 30) * 3
-
-        while current_remaining > 0 and executed < safety_cap:
-            if self._should_stop(task_name, account_name):
-                self.log_signal.emit(f"{prefix}任务已停止", "WARN")
-                self._render_dashboard(
-                    account_name=account_name,
-                    userinfo=userinfo,
-                    stats=stats,
-                    status_text=f"已停止，剩余 {current_remaining} 次",
-                    search_index=None,
-                    search_total=None,
+                await complete_daily_activities(
+                    page,
+                    context,
+                    log=_task_log,
+                    should_stop=_should_stop,
                 )
-                break
+            except Exception as e:
+                self.log_signal.emit(f"{prefix}每日活动失败: {e}", "WARN")
 
-            executed += 1
-            query = generate_random_query()
-            search_url = f"https://www.bing.com/search?q={quote_plus(query)}"
-            try:
-                self.log_signal.emit(f"{prefix}搜索: {query} | 剩余 {current_remaining} 次", "INFO")
-                self.status_signal.emit(f"搜索中，剩余 {current_remaining} 次", "orange")
+        # 3) 搜索任务（若仍有剩余）
+        need_search = total > 0 and remaining > 0 and stats.get("max_points", 0) > 0
+        if not need_search:
+            self.log_signal.emit(f"{prefix}搜索任务已完成或无需执行，跳过搜索", "INFO")
+            self._render_dashboard(
+                account_name=account_name,
+                userinfo=userinfo,
+                stats=stats,
+                status_text="剩余 0 次",
+                search_index=None,
+                search_total=None,
+            )
+        else:
+            delay_cfg = SEARCH_CONFIG["pc"] if device_type == "windows" else SEARCH_CONFIG["mobile"]
+            min_ms = delay_cfg["min_delay_ms"]
+            max_ms = delay_cfg["max_delay_ms"]
 
-                ok = False
+            if page.url == "about:blank" or "bing.com" not in (page.url or ""):
+                await page.goto("https://www.bing.com", wait_until=DOMCONTENTLOADED)
+            await asyncio.sleep(2)
+
+            # 使用实时剩余次数动态计算循环次数，避免因初始估计误差导致提前结束
+            current_remaining = remaining
+            executed = 0
+            # 保险上限，防止意外无限循环（通常 total 就是每天的最大搜索次数）
+            safety_cap = max(total, remaining, 30) * 3
+
+            while current_remaining > 0 and executed < safety_cap:
+                if self._should_stop(task_name, account_name):
+                    self.log_signal.emit(f"{prefix}任务已停止", "WARN")
+                    self._render_dashboard(
+                        account_name=account_name,
+                        userinfo=userinfo,
+                        stats=stats,
+                        status_text=f"已停止，剩余 {current_remaining} 次",
+                        search_index=None,
+                        search_total=None,
+                    )
+                    break
+
+                executed += 1
+                query = generate_random_query()
+                search_url = f"https://www.bing.com/search?q={quote_plus(query)}"
                 try:
-                    ok = await asyncio.wait_for(_perform_bing_search_like_human(page, query), timeout=25)
-                except asyncio.TimeoutError:
-                    self.log_signal.emit(f"{prefix}搜索超时，重试...", "WARN")
+                    self.log_signal.emit(f"{prefix}搜索: {query} | 剩余 {current_remaining} 次", "INFO")
+                    self.status_signal.emit(f"搜索中，剩余 {current_remaining} 次", "orange")
+
+                    ok = False
                     try:
-                        await page.goto("https://www.bing.com", wait_until=DOMCONTENTLOADED, timeout=20000)
+                        ok = await asyncio.wait_for(_perform_bing_search_like_human(page, query), timeout=25)
+                    except asyncio.TimeoutError:
+                        self.log_signal.emit(f"{prefix}搜索超时，重试...", "WARN")
+                        try:
+                            await page.goto("https://www.bing.com", wait_until=DOMCONTENTLOADED, timeout=20000)
+                        except Exception:
+                            pass
+                        ok = False
+                    except Exception:
+                        ok = False
+
+                    if not ok:
+                        await page.goto(search_url, wait_until=DOMCONTENTLOADED)
+                    await _maybe_human_scroll(page)
+                    await _maybe_click_one_result(page)
+
+                except Exception as e:
+                    self.log_signal.emit(f"{prefix}搜索失败: {e}", "WARN")
+                    try:
+                        await page.goto("https://www.bing.com", wait_until=DOMCONTENTLOADED)
                     except Exception:
                         pass
-                    ok = False
-                except Exception:
-                    ok = False
 
-                if not ok:
-                    await page.goto(search_url, wait_until=DOMCONTENTLOADED)
-                await _maybe_human_scroll(page)
-                await _maybe_click_one_result(page)
-
-            except Exception as e:
-                self.log_signal.emit(f"{prefix}搜索失败: {e}", "WARN")
+                # 执行完一次搜索后，实时获取最新剩余次数
                 try:
-                    await page.goto("https://www.bing.com", wait_until=DOMCONTENTLOADED)
+                    userinfo_live = await fetch_rewards_userinfo(context, page=page)
+                    stats_live = compute_remaining_searches(userinfo_live, device_type)
+                    current_remaining = stats_live.get("remaining_searches", current_remaining)
+                    total = stats_live.get("total_searches", total)
+                    userinfo = userinfo_live
+                    stats = stats_live
+                    safety_cap = max(safety_cap, max(total, current_remaining, 30) * 3)
+                    self._render_dashboard(
+                        account_name=account_name,
+                        userinfo=userinfo_live,
+                        stats=stats_live,
+                        status_text=f"剩余 {current_remaining} 次",
+                        search_index=None,
+                        search_total=None,
+                    )
                 except Exception:
-                    pass
+                    current_remaining = max(0, current_remaining - 1)
+                    self._render_dashboard(
+                        account_name=account_name,
+                        userinfo=userinfo,
+                        stats=stats,
+                        status_text=f"剩余 {current_remaining} 次",
+                        search_index=None,
+                        search_total=None,
+                    )
 
-            # 执行完一次搜索后，实时获取最新剩余次数，避免因积分延迟导致的提前结束
-            try:
-                userinfo_live = await fetch_rewards_userinfo(context)
-                stats_live = compute_remaining_searches(userinfo_live, device_type)
-                current_remaining = stats_live.get("remaining_searches", current_remaining)
-                total = stats_live.get("total_searches", total)
-                userinfo = userinfo_live
-                stats = stats_live
-                # 根据最新数据动态抬升安全上限，防止 total 变化导致过早退出
-                safety_cap = max(safety_cap, max(total, current_remaining, 30) * 3)
-                self._render_dashboard(
-                    account_name=account_name,
-                    userinfo=userinfo_live,
-                    stats=stats_live,
-                    status_text=f"剩余 {current_remaining} 次",
-                    search_index=None,
-                    search_total=None,
-                )
-            except Exception:
-                # 若实时刷新失败，则按已完成次数递减估算，确保循环能推进
-                current_remaining = max(0, current_remaining - 1)
-                self._render_dashboard(
-                    account_name=account_name,
-                    userinfo=userinfo,
-                    stats=stats,
-                    status_text=f"剩余 {current_remaining} 次",
-                    search_index=None,
-                    search_total=None,
-                )
-
-            if current_remaining <= 0:
-                self.log_signal.emit(f"{prefix}剩余搜索已清零，任务完成。", "SUCCESS")
-                break
-
-            delay_ms = random.randint(min_ms, max_ms)
-            delay_sec = delay_ms / 1000
-            self.log_signal.emit(f"{prefix}等待 {delay_sec:.1f} 秒...", "INFO")
-            step = 0.5
-            slept = 0.0
-            while slept < delay_sec:
-                await asyncio.sleep(step)
-                slept += step
-                if self._should_stop(task_name, account_name):
+                if current_remaining <= 0:
+                    self.log_signal.emit(f"{prefix}剩余搜索已清零，任务完成。", "SUCCESS")
                     break
-            if self._should_stop(task_name, account_name):
-                self.log_signal.emit(f"{prefix}任务已停止", "WARN")
-                self._render_dashboard(
-                    account_name=account_name,
-                    userinfo=userinfo,
-                    stats=stats,
-                    status_text=f"已停止，剩余 {current_remaining} 次",
-                    search_index=None,
-                    search_total=None,
-                )
-                break
+
+                delay_ms = random.randint(min_ms, max_ms)
+                delay_sec = delay_ms / 1000
+                self.log_signal.emit(f"{prefix}等待 {delay_sec:.1f} 秒...", "INFO")
+                step = 0.5
+                slept = 0.0
+                while slept < delay_sec:
+                    await asyncio.sleep(step)
+                    slept += step
+                    if self._should_stop(task_name, account_name):
+                        break
+                if self._should_stop(task_name, account_name):
+                    self.log_signal.emit(f"{prefix}任务已停止", "WARN")
+                    self._render_dashboard(
+                        account_name=account_name,
+                        userinfo=userinfo,
+                        stats=stats,
+                        status_text=f"已停止，剩余 {current_remaining} 次",
+                        search_index=None,
+                        search_total=None,
+                    )
+                    break
+
+        # 4) 活动/搜索后再领取一次
+        if self.enable_auto_claim and not _should_stop():
+            try:
+                await claim_available_rewards(page, log=_task_log, should_stop=_should_stop)
+            except Exception as e:
+                self.log_signal.emit(f"{prefix}结束领取失败: {e}", "WARN")
 
         # 结束前停止周期刷新任务
         try:
@@ -1268,10 +1351,17 @@ class RewardsGUI(QtWidgets.QMainWindow):
             pass
 
         try:
-            userinfo2 = await fetch_rewards_userinfo(context)
+            userinfo2 = await fetch_rewards_userinfo(context, page=page)
             stats2 = compute_remaining_searches(userinfo2, device_type)
             self.log_signal.emit(f"{prefix}最新进度: {stats2['current_points']} / {stats2['max_points']}", "INFO")
-            self._render_dashboard(account_name=account_name, userinfo=userinfo2, stats=stats2, status_text="剩余 0 次", search_index=None, search_total=None)
+            self._render_dashboard(
+                account_name=account_name,
+                userinfo=userinfo2,
+                stats=stats2,
+                status_text=f"剩余 {stats2.get('remaining_searches', 0)} 次",
+                search_index=None,
+                search_total=None,
+            )
         except Exception as e:
             self.log_signal.emit(f"{prefix}刷新最新进度失败: {e}", "WARN")
 
@@ -1304,6 +1394,11 @@ class RewardsGUI(QtWidgets.QMainWindow):
     # 事件响应
     def _on_headless_changed(self, _checked: bool):
         self.headless_mode = self.cb_headless.isChecked()
+        self.save_config()
+
+    def _on_task_options_changed(self, _checked: bool):
+        self.enable_daily_activities = self.cb_daily.isChecked()
+        self.enable_auto_claim = self.cb_claim.isChecked()
         self.save_config()
 
     # Qt 生命周期

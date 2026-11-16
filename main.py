@@ -811,16 +811,30 @@ async def scrape_rewards_userinfo_from_page(page) -> dict:
         scraped = await page.evaluate(
             """() => {
               const body = (document.body && document.body.innerText) || '';
+              const num = (s) => (s == null ? null : Number(String(s).replace(/,/g, '')));
               const pointsMatch =
                 body.match(/可用积分[^\\d]{0,40}([\\d,]{2,})/) ||
                 body.match(/([\\d,]{2,})\\s*兑换/);
               const levelMatch = body.match(/金牌会员|银牌会员|会员/);
-              const searchMatch = body.match(/搜索:\\s*(\\d+)\\s*\\/\\s*(\\d+)/);
+              // 必应搜索进度 + 卡片分值
+              const searchBlock = body.match(/必应[\\s\\S]{0,80}?搜索:\\s*(\\d+)\\s*\\/\\s*(\\d+)[\\s\\S]{0,40}?(\\d{1,4})/);
+              const searchMatch = searchBlock || body.match(/搜索:\\s*(\\d+)\\s*\\/\\s*(\\d+)/);
+              // 每日活动进度 + 卡片分值
+              const activityBlock = body.match(/每日活动[\\s\\S]{0,80}?活动:\\s*(\\d+)\\s*\\/\\s*(\\d+)[\\s\\S]{0,40}?(\\d{1,4})/);
+              const activityMatch = activityBlock || body.match(/活动:\\s*(\\d+)\\s*\\/\\s*(\\d+)/);
+              const todayPointsMatch = body.match(/今日积分\\s*([\\d,]+)/);
+              const claimableMatch = body.match(/可领取\\s*([\\d,]+)/);
               return {
                 pointsText: pointsMatch ? pointsMatch[1].replace(/,/g, '') : null,
                 levelText: levelMatch ? levelMatch[0] : null,
                 searchDone: searchMatch ? Number(searchMatch[1]) : null,
                 searchTotal: searchMatch ? Number(searchMatch[2]) : null,
+                searchPoints: searchBlock ? num(searchBlock[3]) : null,
+                activityDone: activityMatch ? Number(activityMatch[1]) : null,
+                activityTotal: activityMatch ? Number(activityMatch[2]) : null,
+                activityPoints: activityBlock ? num(activityBlock[3]) : null,
+                todayPoints: todayPointsMatch ? num(todayPointsMatch[1]) : null,
+                claimable: claimableMatch ? num(claimableMatch[1]) : null,
                 title: document.title || '',
                 url: location.href || '',
                 hasRewardsTitle: /Microsoft Rewards|积分商城/.test(document.title || ''),
@@ -845,15 +859,37 @@ async def scrape_rewards_userinfo_from_page(page) -> dict:
     if not scraped.get("levelText") and level_num is not None:
         level_name = {1: "会员", 2: "银牌会员", 3: "金牌会员"}.get(level_num, f"Level{level_num}")
 
-    search_done = scraped.get("searchDone")
-    search_total = scraped.get("searchTotal")
+    search_done = scraped.get("searchDone") if isinstance(scraped.get("searchDone"), int) else 0
+    search_total = scraped.get("searchTotal") if isinstance(scraped.get("searchTotal"), int) else 0
+    activity_done = scraped.get("activityDone") if isinstance(scraped.get("activityDone"), int) else 0
+    activity_total = scraped.get("activityTotal") if isinstance(scraped.get("activityTotal"), int) else 0
+
     points_per_search = int(SEARCH_CONFIG.get("points_per_search") or 3)
-    if isinstance(search_done, int) and isinstance(search_total, int) and search_total >= 0:
-        pc_current = max(0, search_done) * points_per_search
-        pc_max = max(0, search_total) * points_per_search
-    else:
-        pc_current = 0
-        pc_max = 0
+    search_points_max = scraped.get("searchPoints")
+    if not isinstance(search_points_max, int):
+        search_points_max = max(0, search_total) * points_per_search
+    search_points_cur = 0
+    if search_total > 0:
+        search_points_cur = int(round(search_points_max * (search_done / search_total)))
+
+    activity_points_max = scraped.get("activityPoints") if isinstance(scraped.get("activityPoints"), int) else 0
+    activity_points_cur = 0
+    if activity_total > 0 and activity_points_max > 0:
+        activity_points_cur = int(round(activity_points_max * (activity_done / activity_total)))
+
+    # 面板「任务」：搜索 + 每日活动
+    task_current = max(0, search_done) + max(0, activity_done)
+    task_max = max(0, search_total) + max(0, activity_total)
+
+    # 面板「积分」：优先今日积分；否则按搜索+活动估算
+    today_points = scraped.get("todayPoints") if isinstance(scraped.get("todayPoints"), int) else None
+    claimable = scraped.get("claimable") if isinstance(scraped.get("claimable"), int) else 0
+    points_current = today_points if today_points is not None else (search_points_cur + activity_points_cur)
+    points_max = max(points_current + max(0, claimable), search_points_max + activity_points_max, points_current)
+
+    # 兼容旧搜索逻辑（仍以搜索积分为主）
+    pc_current = search_points_cur
+    pc_max = search_points_max
 
     active_level = f"newLevel{level_num}" if level_num else level_name
     return {
@@ -883,6 +919,18 @@ async def scrape_rewards_userinfo_from_page(page) -> dict:
         "_page": {
             "title": scraped.get("title"),
             "url": scraped.get("url") or last_url,
+        },
+        "_progress": {
+            "search_done": search_done,
+            "search_total": search_total,
+            "activity_done": activity_done,
+            "activity_total": activity_total,
+            "today_points": today_points,
+            "claimable": claimable,
+            "task_current": task_current,
+            "task_max": task_max,
+            "points_current": points_current,
+            "points_max": points_max,
         },
     }
 
@@ -1093,6 +1141,8 @@ async def console_dashboard_refresh_loop(context, device_type: str, state: dict)
 
 async def run_rewards_auto_search(page, context, device_type: str):
     """自动完成 Bing 搜索任务（等价于 userscript 的 startSearchTask）。"""
+    from activities import claim_available_rewards, complete_daily_activities
+
     # 控制台仪表盘：启动后台刷新
     state = {"userinfo": None, "stats": None, "error": None}
     refresh_task = asyncio.create_task(console_dashboard_refresh_loop(context, device_type, state))
@@ -1102,7 +1152,7 @@ async def run_rewards_auto_search(page, context, device_type: str):
     first_paint = True
     print("\n正在获取 Rewards 搜索进度...")
     try:
-        userinfo = await fetch_rewards_userinfo(context)
+        userinfo = await fetch_rewards_userinfo(context, page=page)
         stats = compute_remaining_searches(userinfo, device_type)
         state["userinfo"] = userinfo
         state["stats"] = stats
@@ -1110,6 +1160,16 @@ async def run_rewards_auto_search(page, context, device_type: str):
         state["error"] = str(e)
         userinfo = None
         stats = None
+
+    # 先领取 + 每日活动（即使搜索已完成也执行）
+    try:
+        await claim_available_rewards(page, log=lambda m: print(m))
+    except Exception as e:
+        print(f"自动领取失败: {e}")
+    try:
+        await complete_daily_activities(page, context, log=lambda m: print(m))
+    except Exception as e:
+        print(f"每日活动失败: {e}")
 
     _render_console_dashboard(
         _format_console_dashboard(
