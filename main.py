@@ -12,7 +12,7 @@ from urllib.parse import quote_plus
 from playwright.async_api import async_playwright
 
 # 常量：集中管理字符串，避免拼写检查对字符串字面量误报
-BROWSER_CHANNEL = "chrome"
+BROWSER_CHANNEL = "msedge"
 DOMCONTENTLOADED = "domcontentloaded"
 
 # 记录程序启动时间，用于展示运行时长
@@ -668,6 +668,397 @@ async def save_account_session(context, cookies_dir: Path, account: dict) -> tup
     return target, removed
 
 
+
+_earn_progress_cache: dict = {"ts": 0.0, "data": None, "ver": 4}
+_EARN_PROGRESS_TTL_SEC = 45.0
+_EARN_PROGRESS_VER = 4
+
+
+def _normalize_streaks(raw_streaks) -> list:
+    out = []
+    for s in raw_streaks or []:
+        if not isinstance(s, dict):
+            continue
+        out.append(
+            {
+                "id": s.get("id"),
+                "name": s.get("name"),
+                "title": s.get("title"),
+                "day": s.get("day"),
+                "day_total": s.get("day_total", s.get("dayTotal")),
+                "goal_cur": s.get("goal_cur", s.get("goalCur")),
+                "goal_max": s.get("goal_max", s.get("goalMax")),
+            }
+        )
+    return out
+
+
+def _normalize_stamps(raw_stamps) -> dict:
+    if not isinstance(raw_stamps, dict):
+        return {"current": None, "total": None, "reward": None}
+    return {
+        "current": raw_stamps.get("current"),
+        "total": raw_stamps.get("total"),
+        "reward": raw_stamps.get("reward"),
+    }
+
+
+async def scrape_earn_page_progress(page, *, force: bool = False) -> dict:
+    """从赚取页抓连续打卡 / 印章奖励 / 日常任务。短缓存避免高频刷新反复跳转。"""
+    now = time.time()
+    cached = _earn_progress_cache.get("data")
+    if (
+        not force
+        and cached is not None
+        and _earn_progress_cache.get("ver") == _EARN_PROGRESS_VER
+        and (now - float(_earn_progress_cache.get("ts") or 0)) < _EARN_PROGRESS_TTL_SEC
+    ):
+        return cached
+
+    result = {
+        "pending": 0,
+        "done": 0,
+        "pointsPending": 0,
+        "streaks": [],
+        "stamps": {"current": None, "total": None, "reward": None},
+    }
+    try:
+        cur = ""
+        try:
+            cur = page.url or ""
+        except Exception:
+            cur = ""
+        if "rewards.bing.com/earn" not in cur:
+            await page.goto("https://rewards.bing.com/earn", wait_until=DOMCONTENTLOADED, timeout=45000)
+            await page.wait_for_timeout(1800)
+        else:
+            await page.wait_for_timeout(400)
+
+        earn_extra = await page.evaluate(
+            """() => {
+              const norm = (s) => (s || '').trim().replace(/\\s+/g, ' ');
+              const yOf = (el) => {
+                try { return el.getBoundingClientRect().top + window.scrollY; }
+                catch (e) { return 0; }
+              };
+              const body = norm(document.body && document.body.innerText);
+
+              let heading = null;
+              for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p')) {
+                const own = norm(el.innerText || '');
+                if (own === '日常任务' || (own.startsWith('日常任务') && own.length <= 12)) {
+                  heading = el; break;
+                }
+              }
+              let pending = 0, done = 0, pointsPending = 0;
+              if (heading) {
+                const headingY = yOf(heading);
+                const nextRe = /^(每日任务|每日活动|更多活动|探索|游戏|必应搜索|邀请|连续打卡|Redeem|More activities|Daily set)/i;
+                let nextY = Infinity;
+                for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p')) {
+                  const own = norm(el.innerText || '');
+                  if (!own || own.length > 28 || own.startsWith('日常任务')) continue;
+                  if (!nextRe.test(own)) continue;
+                  const y = yOf(el);
+                  if (y > headingY + 20 && y < nextY) nextY = y;
+                }
+                const seen = new Set();
+                for (const el of document.querySelectorAll('a[href], button, [role="link"], [role="button"]')) {
+                  const y = yOf(el);
+                  if (y < headingY - 4 || y >= nextY) continue;
+                  let scope = el;
+                  for (let i = 0; i < 5; i++) {
+                    const p = scope.parentElement;
+                    if (!p) break;
+                    const pt = norm(p.innerText || '');
+                    if (pt.length > 0 && pt.length <= 220 && !pt.startsWith('日常任务')) scope = p;
+                    else break;
+                  }
+                  const nearby = norm(scope.innerText || '').slice(0, 220);
+                  const key = nearby.slice(0, 80);
+                  if (!key || seen.has(key)) continue;
+                  seen.add(key);
+                  const m = nearby.match(/\\+\\s*(\\d+)/);
+                  if (m) { pending += 1; pointsPending += Number(m[1]) || 0; }
+                  else if (/(已完成|completed|已领取)/i.test(nearby)) done += 1;
+                }
+              }
+
+
+              // 连续打卡：在分区内按「第x天」卡片分类（Edge 用「分钟:」识别）
+              const streaks = [];
+              const seenIds = new Set();
+              const classify = (t) => {
+                if (/分钟\\s*[:：]/.test(t) || (/Edge/i.test(t) && /浏览器/.test(t)) || /Edge\\s*浏览器连续打卡/.test(t) || /Edge浏览器连续打卡/.test(t)) {
+                  return { id: 'edge', name: 'Edge', goalRe: /分钟\\s*[:：]\\s*(\\d+)\\s*\\/\\s*(\\d+)/ };
+                }
+                if (/签到\\s*[:：]/.test(t) || /必应应用连续打卡/.test(t)) {
+                  return { id: 'bing_app', name: '应用', goalRe: /签到\\s*[:：]\\s*(\\d+)\\s*\\/\\s*(\\d+)/ };
+                }
+                if (/每日连续打卡活动/.test(t) || (/活动\\s*[:：]/.test(t) && /连续打卡/.test(t))) {
+                  return { id: 'daily_activity', name: '活动', goalRe: /活动\\s*[:：]\\s*(\\d+)\\s*\\/\\s*(\\d+)/ };
+                }
+                if (/必应搜索连续打卡/.test(t) || (/搜索\\s*[:：]/.test(t) && /连续打卡/.test(t))) {
+                  return { id: 'bing_search', name: '搜索', goalRe: /搜索\\s*[:：]\\s*(\\d+)\\s*\\/\\s*(\\d+)/ };
+                }
+                return null;
+              };
+
+              const streakCandidates = [];
+              for (const el of document.querySelectorAll('a, div, section, article, li, button')) {
+                const txt = norm(el.innerText || '');
+                if (!/第\\s*\\d+\\s*天/.test(txt)) continue;
+                if (txt.length < 10 || txt.length > 420) continue;
+                if (!/(搜索\\s*[:：]|活动\\s*[:：]|分钟\\s*[:：]|签到\\s*[:：]|连续打卡|Edge)/i.test(txt)) continue;
+                const kind = classify(txt);
+                if (!kind) continue;
+                streakCandidates.push({ el, txt, kind, len: txt.length });
+              }
+              // 同 id 取最短文案（更接近单卡）
+              streakCandidates.sort((a, b) => a.len - b.len);
+              for (const c of streakCandidates) {
+                if (seenIds.has(c.kind.id)) continue;
+                const dayM = c.txt.match(/第\\s*(\\d+)\\s*天\\s*\\/\\s*共\\s*(\\d+)\\s*天/);
+                const goalM = c.txt.match(c.kind.goalRe);
+                seenIds.add(c.kind.id);
+                streaks.push({
+                  id: c.kind.id,
+                  name: c.kind.name,
+                  title: c.kind.name,
+                  day: dayM ? Number(dayM[1]) : null,
+                  dayTotal: dayM ? Number(dayM[2]) : null,
+                  goalCur: goalM ? Number(goalM[1]) : null,
+                  goalMax: goalM ? Number(goalM[2]) : null,
+                });
+              }
+
+              // 正文兜底：Edge 标题可能带特殊空格
+              if (!seenIds.has('edge')) {
+                const edgeRe = /Edge\\s*浏览器连续打卡[\\s\\S]{0,280}?第\\s*(\\d+)\\s*天\\s*\\/\\s*共\\s*(\\d+)\\s*天[\\s\\S]{0,120}?分钟\\s*[:：]\\s*(\\d+)\\s*\\/\\s*(\\d+)/i;
+                const em = body.match(edgeRe);
+                if (em) {
+                  streaks.push({
+                    id: 'edge', name: 'Edge', title: 'Edge',
+                    day: Number(em[1]), dayTotal: Number(em[2]),
+                    goalCur: Number(em[3]), goalMax: Number(em[4]),
+                  });
+                  seenIds.add('edge');
+                } else {
+                  const em2 = body.match(/分钟\\s*[:：]\\s*(\\d+)\\s*\\/\\s*(\\d+)/);
+                  const em3 = body.match(/Edge[\\s\\S]{0,200}?第\\s*(\\d+)\\s*天\\s*\\/\\s*共\\s*(\\d+)\\s*天/i);
+                  if (em2 || em3) {
+                    streaks.push({
+                      id: 'edge', name: 'Edge', title: 'Edge',
+                      day: em3 ? Number(em3[1]) : null,
+                      dayTotal: em3 ? Number(em3[2]) : null,
+                      goalCur: em2 ? Number(em2[1]) : null,
+                      goalMax: em2 ? Number(em2[2]) : null,
+                    });
+                    seenIds.add('edge');
+                  }
+                }
+              }
+
+              // 印章：奖励/总数用文案；已得数量优先数圆形槽位，再用 HTML 字段兜底
+              const stamps = { current: null, total: null, reward: null };
+              const totalM = body.match(/赚取\\s*(\\d+)\\s*个印章/);
+              if (totalM) stamps.total = Number(totalM[1]);
+              let stampCard = null;
+              let stampCardScore = 1e9;
+              for (const el of document.querySelectorAll('a, div, section, article')) {
+                const t = norm(el.innerText || '');
+                if (!/个印章/.test(t) || !/奖励/.test(t)) continue;
+                if (t.length < 8 || t.length > 420) continue;
+                if (t.length < stampCardScore) {
+                  stampCard = el;
+                  stampCardScore = t.length;
+                  const rm = t.match(/([\\d,]+)\\s*奖励/);
+                  if (rm) stamps.reward = Number(String(rm[1]).replace(/,/g, ''));
+                  if (!stamps.total) {
+                    const tm = t.match(/赚取\\s*(\\d+)\\s*个印章/);
+                    if (tm) stamps.total = Number(tm[1]);
+                  }
+                }
+              }
+              // 文案节点可能不含圆点，向上扩到能包住印章网格的容器
+              if (stampCard) {
+                let node = stampCard;
+                for (let i = 0; i < 5 && node.parentElement; i++) {
+                  const parent = node.parentElement;
+                  const pt = norm(parent.innerText || '');
+                  if (pt.length > 700) break;
+                  const svgs = parent.querySelectorAll('svg, img').length;
+                  const boxes = parent.querySelectorAll('div, span, button').length;
+                  if (svgs >= 8 || boxes >= 20) {
+                    stampCard = parent;
+                  }
+                  node = parent;
+                }
+              }
+
+              // 印章已得数：优先 progressbar / JSON；再按「两行×约6个」星标网格计黑圆
+              const readLum = (el) => {
+                let node = el;
+                for (let i = 0; i < 4 && node; i++) {
+                  const bg = (getComputedStyle(node).backgroundColor || '').toLowerCase();
+                  const m = bg.match(/rgba?\\((\\d+),\\s*(\\d+),\\s*(\\d+)(?:,\\s*([\\d.]+))?/);
+                  if (m) {
+                    const a = m[4] != null ? Number(m[4]) : 1;
+                    if (a >= 0.08) {
+                      return (Number(m[1]) + Number(m[2]) + Number(m[3])) / 3;
+                    }
+                  }
+                  node = node.parentElement;
+                }
+                return null;
+              };
+
+              if (stampCard) {
+                const bar = stampCard.querySelector('[role="progressbar"]');
+                if (bar) {
+                  const now = Number(bar.getAttribute('aria-valuenow'));
+                  const max = Number(bar.getAttribute('aria-valuemax'));
+                  if (Number.isFinite(now)) stamps.current = now;
+                  if (Number.isFinite(max) && max > 0) stamps.total = max;
+                }
+              }
+
+              if (stamps.current == null) {
+                const html = document.documentElement.innerHTML || '';
+                const patterns = [
+                  /"earnedStamps"\\s*:\\s*(\\d+)/i,
+                  /"stampsEarned"\\s*:\\s*(\\d+)/i,
+                  /"completedStamps"\\s*:\\s*(\\d+)/i,
+                  /"stampsCollected"\\s*:\\s*(\\d+)/i,
+                  /"stampCount"\\s*:\\s*(\\d+)/i,
+                ];
+                for (const re of patterns) {
+                  const m = html.match(re);
+                  if (!m) continue;
+                  const n = Number(m[1]);
+                  if (!Number.isFinite(n)) continue;
+                  if (stamps.total && (n < 0 || n > stamps.total)) continue;
+                  stamps.current = n;
+                  break;
+                }
+              }
+
+              // 核心：只数印章卡里「黑色实心圆」（已得），灰框空槽不计入
+              if (stamps.current == null && stampCard) {
+                const expect = stamps.total || 12;
+                const seenPos = new Set();
+                const darkDots = [];
+                const allDots = [];
+                for (const el of stampCard.querySelectorAll('div, span, button, i, svg, img')) {
+                  const r = el.getBoundingClientRect();
+                  if (r.width < 16 || r.width > 42 || r.height < 16 || r.height > 42) continue;
+                  if (Math.abs(r.width - r.height) > 7) continue;
+                  let nested = false;
+                  for (const ch of Array.from(el.children || [])) {
+                    const cr = ch.getBoundingClientRect();
+                    if (cr.width >= 16 && cr.width <= 42 && Math.abs(cr.width - cr.height) <= 7) {
+                      nested = true; break;
+                    }
+                  }
+                  if (nested && el.tagName !== 'SVG' && el.tagName !== 'IMG') continue;
+                  const key = Math.round(r.left / 2) * 2 + ':' + Math.round(r.top / 2) * 2;
+                  if (seenPos.has(key)) continue;
+                  seenPos.add(key);
+                  const lum = readLum(el);
+                  if (lum == null) continue;
+                  const item = { lum, x: r.left, y: r.top, w: r.width };
+                  allDots.push(item);
+                  // 页面上已得印章是近黑色圆
+                  if (lum <= 95) darkDots.push(item);
+                }
+
+                // 优先：黑圆数量（通常正好是已得印章）
+                if (darkDots.length >= 1 && darkDots.length <= expect) {
+                  stamps.current = darkDots.length;
+                } else if (allDots.length >= 8) {
+                  // 按两行网格，取每行最多 6 个后数黑圆
+                  const ys = allDots.map((d) => d.y).sort((a, b) => a - b);
+                  let splitY = ys[Math.floor(ys.length / 2)];
+                  let maxGap = 0;
+                  for (let i = 1; i < ys.length; i++) {
+                    const gap = ys[i] - ys[i - 1];
+                    if (gap > maxGap) { maxGap = gap; splitY = (ys[i] + ys[i - 1]) / 2; }
+                  }
+                  const rowOf = (row) => row.sort((a, b) => a.x - b.x).slice(0, 6);
+                  const r1 = rowOf(allDots.filter((d) => d.y < splitY));
+                  const r2 = rowOf(allDots.filter((d) => d.y >= splitY));
+                  const grid = r1.concat(r2);
+                  const filled = grid.filter((d) => d.lum <= 95).length;
+                  if (filled >= 1 && filled <= expect) stamps.current = filled;
+                }
+                if (!stamps.total) stamps.total = expect;
+              }
+
+              return { pending, done, pointsPending, streaks, stamps };
+            }"""
+        ) or {}
+        result = {
+            "pending": int(earn_extra.get("pending") or 0),
+            "done": int(earn_extra.get("done") or 0),
+            "pointsPending": int(earn_extra.get("pointsPending") or 0),
+            "streaks": _normalize_streaks(earn_extra.get("streaks")),
+            "stamps": _normalize_stamps(earn_extra.get("stamps")),
+        }
+        _earn_progress_cache["ts"] = now
+        _earn_progress_cache["data"] = result
+        _earn_progress_cache["ver"] = _EARN_PROGRESS_VER
+    except Exception:
+        if cached is not None and _earn_progress_cache.get("ver") == _EARN_PROGRESS_VER:
+            return cached
+    return result
+
+
+def _merge_earn_progress_into_userinfo(userinfo: dict, earn: dict) -> dict:
+    if not isinstance(userinfo, dict):
+        userinfo = {}
+    progress = userinfo.get("_progress")
+    if not isinstance(progress, dict):
+        progress = {}
+        userinfo["_progress"] = progress
+
+    streaks = earn.get("streaks") or []
+    stamps = earn.get("stamps") or {}
+    if streaks:
+        progress["streaks"] = streaks
+    if isinstance(stamps, dict) and (
+        stamps.get("current") is not None
+        or stamps.get("total") is not None
+        or stamps.get("reward") is not None
+    ):
+        progress["stamps"] = stamps
+
+    routine_pending = int(earn.get("pending") or 0)
+    routine_done = int(earn.get("done") or 0)
+    if "routine_done" not in progress:
+        progress["routine_done"] = routine_done
+        progress["routine_total"] = routine_pending + routine_done
+    return userinfo
+
+
+async def _attach_earn_progress(page, userinfo: dict) -> dict:
+    if page is None:
+        return userinfo
+    try:
+        earn = await scrape_earn_page_progress(page, force=False)
+        streaks = earn.get("streaks") or []
+        stamps = earn.get("stamps") or {}
+        need_retry = False
+        if not any(s.get("id") == "edge" and s.get("day") is not None for s in streaks):
+            need_retry = True
+        if stamps.get("current") is None and stamps.get("total"):
+            need_retry = True
+        if need_retry:
+            earn = await scrape_earn_page_progress(page, force=True)
+        return _merge_earn_progress_into_userinfo(userinfo, earn)
+    except Exception:
+        return userinfo
+
+
 async def fetch_rewards_userinfo(context, *, timeout_ms: int = 15000, page=None):
     """从 Rewards API 拉取用户信息（使用当前 context 的 Cookie 身份）。
 
@@ -712,7 +1103,7 @@ async def fetch_rewards_userinfo(context, *, timeout_ms: int = 15000, page=None)
                 }"""
             )
             if isinstance(data, dict):
-                return data
+                return await _attach_earn_progress(page, data)
             raise RuntimeError("Rewards API 返回了非 JSON 对象")
         except Exception as e:
             # 回退到 context.request
@@ -753,7 +1144,10 @@ async def fetch_rewards_userinfo(context, *, timeout_ms: int = 15000, page=None)
                     f"Rewards API 请求失败: {detail}; scrape={scrape_err}"
                 ) from scrape_err
         raise RuntimeError(f"Rewards API 请求失败: {detail}")
-    return await resp.json()
+    data = await resp.json()
+    if isinstance(data, dict):
+        return await _attach_earn_progress(page, data)
+    return data
 
 
 def _parse_balance_level_from_html(html: str) -> tuple[int | None, int | None]:
@@ -812,18 +1206,80 @@ async def scrape_rewards_userinfo_from_page(page) -> dict:
             """() => {
               const body = (document.body && document.body.innerText) || '';
               const num = (s) => (s == null ? null : Number(String(s).replace(/,/g, '')));
+              const norm = (s) => (s || '').trim().replace(/\\s+/g, ' ');
+              const yOf = (el) => {
+                try { return el.getBoundingClientRect().top + window.scrollY; }
+                catch (e) { return 0; }
+              };
+              // 统计某分区内：带 +分 的待做卡 / 已完成卡
+              const countSection = (titles, nextReSource) => {
+                const titleSet = (titles || []).map(norm).filter(Boolean);
+                let heading = null;
+                for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p')) {
+                  const own = norm(el.innerText || '');
+                  if (!own || own.length > 24) continue;
+                  if (titleSet.some((t) => own === t || (own.startsWith(t) && own.length <= t.length + 6))) {
+                    heading = el;
+                    break;
+                  }
+                }
+                if (!heading) return { pending: 0, done: 0, pointsPending: 0 };
+                const headingY = yOf(heading);
+                let nextRe;
+                try { nextRe = new RegExp(nextReSource, 'i'); } catch (e) { nextRe = /^(更多|探索|游戏)/i; }
+                let nextY = Infinity;
+                for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p')) {
+                  const own = norm(el.innerText || '');
+                  if (!own || own.length > 28) continue;
+                  if (titleSet.some((t) => own === t || own.startsWith(t))) continue;
+                  if (!nextRe.test(own)) continue;
+                  const y = yOf(el);
+                  if (y > headingY + 20 && y < nextY) nextY = y;
+                }
+                const seen = new Set();
+                let pending = 0, done = 0, pointsPending = 0;
+                for (const el of document.querySelectorAll('a[href], button, [role="link"], [role="button"]')) {
+                  const y = yOf(el);
+                  if (y < headingY - 4 || y >= nextY) continue;
+                  let scope = el;
+                  for (let i = 0; i < 5; i++) {
+                    const p = scope.parentElement;
+                    if (!p) break;
+                    const pt = norm(p.innerText || '');
+                    if (pt.length > 0 && pt.length <= 220 && !titleSet.some((t) => pt.startsWith(t))) scope = p;
+                    else break;
+                  }
+                  const nearby = norm(scope.innerText || '').slice(0, 220);
+                  if (!nearby || nearby.length < 4) continue;
+                  const key = nearby.slice(0, 80);
+                  if (seen.has(key)) continue;
+                  seen.add(key);
+                  const m = nearby.match(/\\+\\s*(\\d+)/);
+                  if (m) {
+                    pending += 1;
+                    pointsPending += Number(m[1]) || 0;
+                  } else if (/(已完成|completed|已领取)/i.test(nearby)) {
+                    done += 1;
+                  }
+                }
+                return { pending, done, pointsPending };
+              };
+
               const pointsMatch =
                 body.match(/可用积分[^\\d]{0,40}([\\d,]{2,})/) ||
                 body.match(/([\\d,]{2,})\\s*兑换/);
               const levelMatch = body.match(/金牌会员|银牌会员|会员/);
-              // 必应搜索进度 + 卡片分值
               const searchBlock = body.match(/必应[\\s\\S]{0,80}?搜索:\\s*(\\d+)\\s*\\/\\s*(\\d+)[\\s\\S]{0,40}?(\\d{1,4})/);
               const searchMatch = searchBlock || body.match(/搜索:\\s*(\\d+)\\s*\\/\\s*(\\d+)/);
-              // 每日活动进度 + 卡片分值
               const activityBlock = body.match(/每日活动[\\s\\S]{0,80}?活动:\\s*(\\d+)\\s*\\/\\s*(\\d+)[\\s\\S]{0,40}?(\\d{1,4})/);
               const activityMatch = activityBlock || body.match(/活动:\\s*(\\d+)\\s*\\/\\s*(\\d+)/);
               const todayPointsMatch = body.match(/今日积分\\s*([\\d,]+)/);
               const claimableMatch = body.match(/可领取\\s*([\\d,]+)/);
+              // 首页「每日任务」
+              const dailySet = countSection(
+                ['每日任务', 'Daily set', 'Daily Set', 'Daily tasks'],
+                '^(日常任务|每日活动|更多活动|探索|游戏|必应搜索|邀请|More activities|Earn|Redeem)'
+              );
               return {
                 pointsText: pointsMatch ? pointsMatch[1].replace(/,/g, '') : null,
                 levelText: levelMatch ? levelMatch[0] : null,
@@ -833,6 +1289,9 @@ async def scrape_rewards_userinfo_from_page(page) -> dict:
                 activityDone: activityMatch ? Number(activityMatch[1]) : null,
                 activityTotal: activityMatch ? Number(activityMatch[2]) : null,
                 activityPoints: activityBlock ? num(activityBlock[3]) : null,
+                dailySetPending: dailySet.pending,
+                dailySetDone: dailySet.done,
+                dailySetPointsPending: dailySet.pointsPending,
                 todayPoints: todayPointsMatch ? num(todayPointsMatch[1]) : null,
                 claimable: claimableMatch ? num(claimableMatch[1]) : null,
                 title: document.title || '',
@@ -855,6 +1314,22 @@ async def scrape_rewards_userinfo_from_page(page) -> dict:
     if balance is None:
         raise RuntimeError(f"页面已打开但未能解析可用积分 ({last_url or 'unknown'})")
 
+    # 再扫赚取页：日常任务 + 连续打卡 + 印章
+    earn_routine = {"pending": 0, "done": 0, "pointsPending": 0}
+    earn_streaks: list = []
+    earn_stamps = {"current": None, "total": None, "reward": None}
+    try:
+        earn_extra = await scrape_earn_page_progress(page, force=True)
+        earn_routine = {
+            "pending": int(earn_extra.get("pending") or 0),
+            "done": int(earn_extra.get("done") or 0),
+            "pointsPending": int(earn_extra.get("pointsPending") or 0),
+        }
+        earn_streaks = earn_extra.get("streaks") or []
+        earn_stamps = earn_extra.get("stamps") or earn_stamps
+    except Exception:
+        pass
+
     level_name = scraped.get("levelText") or "未知"
     if not scraped.get("levelText") and level_num is not None:
         level_name = {1: "会员", 2: "银牌会员", 3: "金牌会员"}.get(level_num, f"Level{level_num}")
@@ -863,6 +1338,16 @@ async def scrape_rewards_userinfo_from_page(page) -> dict:
     search_total = scraped.get("searchTotal") if isinstance(scraped.get("searchTotal"), int) else 0
     activity_done = scraped.get("activityDone") if isinstance(scraped.get("activityDone"), int) else 0
     activity_total = scraped.get("activityTotal") if isinstance(scraped.get("activityTotal"), int) else 0
+
+    daily_set_pending = int(scraped.get("dailySetPending") or 0)
+    daily_set_done = int(scraped.get("dailySetDone") or 0)
+    daily_set_points_pending = int(scraped.get("dailySetPointsPending") or 0)
+    daily_set_total = daily_set_pending + daily_set_done
+
+    routine_pending = int((earn_routine or {}).get("pending") or 0)
+    routine_done = int((earn_routine or {}).get("done") or 0)
+    routine_points_pending = int((earn_routine or {}).get("pointsPending") or 0)
+    routine_total = routine_pending + routine_done
 
     points_per_search = int(SEARCH_CONFIG.get("points_per_search") or 3)
     search_points_max = scraped.get("searchPoints")
@@ -877,15 +1362,30 @@ async def scrape_rewards_userinfo_from_page(page) -> dict:
     if activity_total > 0 and activity_points_max > 0:
         activity_points_cur = int(round(activity_points_max * (activity_done / activity_total)))
 
-    # 面板「任务」：搜索 + 每日活动
-    task_current = max(0, search_done) + max(0, activity_done)
-    task_max = max(0, search_total) + max(0, activity_total)
+    # 面板「任务」：搜索 + 每日活动 + 首页每日任务 + 赚取页日常任务
+    task_current = (
+        max(0, search_done)
+        + max(0, activity_done)
+        + max(0, daily_set_done)
+        + max(0, routine_done)
+    )
+    task_max = (
+        max(0, search_total)
+        + max(0, activity_total)
+        + max(0, daily_set_total)
+        + max(0, routine_total)
+    )
 
-    # 面板「积分」：优先今日积分；否则按搜索+活动估算
+    # 面板「积分」：优先今日积分；上限含可领取与各分区待领分
     today_points = scraped.get("todayPoints") if isinstance(scraped.get("todayPoints"), int) else None
     claimable = scraped.get("claimable") if isinstance(scraped.get("claimable"), int) else 0
     points_current = today_points if today_points is not None else (search_points_cur + activity_points_cur)
-    points_max = max(points_current + max(0, claimable), search_points_max + activity_points_max, points_current)
+    points_max = max(
+        points_current + max(0, claimable),
+        search_points_max + activity_points_max + daily_set_points_pending + routine_points_pending,
+        points_current + daily_set_points_pending + routine_points_pending,
+        points_current,
+    )
 
     # 兼容旧搜索逻辑（仍以搜索积分为主）
     pc_current = search_points_cur
@@ -925,12 +1425,18 @@ async def scrape_rewards_userinfo_from_page(page) -> dict:
             "search_total": search_total,
             "activity_done": activity_done,
             "activity_total": activity_total,
+            "daily_set_done": daily_set_done,
+            "daily_set_total": daily_set_total,
+            "routine_done": routine_done,
+            "routine_total": routine_total,
             "today_points": today_points,
             "claimable": claimable,
             "task_current": task_current,
             "task_max": task_max,
             "points_current": points_current,
             "points_max": points_max,
+            "streaks": _normalize_streaks(earn_streaks),
+            "stamps": _normalize_stamps(earn_stamps),
         },
     }
 

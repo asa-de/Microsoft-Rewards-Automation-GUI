@@ -97,35 +97,62 @@ class DashboardWidget(QtWidgets.QFrame):
         account_layout.setColumnStretch(3, 1)
         layout.addWidget(account_card)
         
-        # 今日进度卡片：任务 + 积分
+        # 今日进度：连续打卡来源 + 积分
         progress_card = self._create_card()
         progress_layout = QtWidgets.QVBoxLayout(progress_card)
         progress_layout.setContentsMargins(10, 10, 10, 10)
         progress_layout.setSpacing(8)
 
-        stats_row = QtWidgets.QGridLayout()
-        stats_row.setHorizontalSpacing(12)
-        stats_row.setVerticalSpacing(6)
+        lbl_src_title = QtWidgets.QLabel("来源（连续打卡）")
+        lbl_src_title.setStyleSheet("font-weight: bold; font-size: 13px; color: #e0e0e0;")
+        progress_layout.addWidget(lbl_src_title)
 
-        lbl_task_title = QtWidgets.QLabel("任务:")
-        lbl_task_title.setStyleSheet("font-weight: bold; color: #e0e0e0;")
-        self.lbl_tasks = QtWidgets.QLabel("-- / --")
-        self.lbl_tasks.setStyleSheet("font-size: 13px; color: #aaa;")
+        stamps_row = QtWidgets.QHBoxLayout()
+        lbl_stamps_title = QtWidgets.QLabel("印章:")
+        lbl_stamps_title.setStyleSheet("font-weight: bold; color: #e0e0e0;")
+        self.lbl_stamps = QtWidgets.QLabel("-- / --")
+        self.lbl_stamps.setStyleSheet("font-size: 12px; color: #f0c36d;")
+        self.lbl_stamp_reward = QtWidgets.QLabel("")
+        self.lbl_stamp_reward.setStyleSheet("font-size: 12px; color: #aaa;")
+        stamps_row.addWidget(lbl_stamps_title)
+        stamps_row.addWidget(self.lbl_stamps)
+        stamps_row.addWidget(self.lbl_stamp_reward, 1)
+        progress_layout.addLayout(stamps_row)
 
+        self.streak_grid = QtWidgets.QGridLayout()
+        self.streak_grid.setHorizontalSpacing(8)
+        self.streak_grid.setVerticalSpacing(4)
+        self.streak_labels: dict[str, tuple] = {}
+        streak_defs = [
+            ("bing_search", "搜索"),
+            ("daily_activity", "活动"),
+            ("edge", "Edge"),
+            ("bing_app", "应用"),
+        ]
+        for row, (sid, name) in enumerate(streak_defs):
+            name_lbl = QtWidgets.QLabel(name)
+            name_lbl.setStyleSheet("color: #cfcfcf; font-size: 12px;")
+            day_lbl = QtWidgets.QLabel("第--/--天")
+            day_lbl.setStyleSheet("color: #aaa; font-size: 12px;")
+            goal_lbl = QtWidgets.QLabel("--/--")
+            goal_lbl.setStyleSheet("color: #8ab4f8; font-size: 12px;")
+            self.streak_grid.addWidget(name_lbl, row, 0)
+            self.streak_grid.addWidget(day_lbl, row, 1)
+            self.streak_grid.addWidget(goal_lbl, row, 2)
+            self.streak_labels[sid] = (name_lbl, day_lbl, goal_lbl)
+        self.streak_grid.setColumnStretch(1, 1)
+        self.streak_grid.setColumnStretch(2, 1)
+        progress_layout.addLayout(self.streak_grid)
+
+        points_row = QtWidgets.QHBoxLayout()
         lbl_points_today_title = QtWidgets.QLabel("积分:")
         lbl_points_today_title.setStyleSheet("font-weight: bold; color: #e0e0e0;")
         self.lbl_today_points = QtWidgets.QLabel("-- / --")
         self.lbl_today_points.setStyleSheet("font-size: 13px; color: #aaa;")
+        points_row.addWidget(lbl_points_today_title)
+        points_row.addWidget(self.lbl_today_points, 1)
+        progress_layout.addLayout(points_row)
 
-        stats_row.addWidget(lbl_task_title, 0, 0)
-        stats_row.addWidget(self.lbl_tasks, 0, 1)
-        stats_row.addWidget(lbl_points_today_title, 0, 2)
-        stats_row.addWidget(self.lbl_today_points, 0, 3)
-        stats_row.setColumnStretch(1, 1)
-        stats_row.setColumnStretch(3, 1)
-        progress_layout.addLayout(stats_row)
-
-        # 任务进度条
         self.progress_today = QtWidgets.QProgressBar()
         self.progress_today.setMinimum(0)
         self.progress_today.setMaximum(100)
@@ -148,19 +175,6 @@ class DashboardWidget(QtWidgets.QFrame):
         progress_layout.addWidget(self.progress_today)
 
         layout.addWidget(progress_card)
-        
-        # 状态卡片
-        status_card = self._create_card()
-        status_layout = QtWidgets.QHBoxLayout(status_card)
-        status_layout.setContentsMargins(10, 8, 10, 8)
-        lbl_status_title = QtWidgets.QLabel("状态:")
-        lbl_status_title.setStyleSheet("font-weight: bold; color: #e0e0e0;")
-        self.lbl_status = QtWidgets.QLabel("等待中...")
-        self.lbl_status.setStyleSheet("font-size: 13px; color: #1a73e8;")
-        status_layout.addWidget(lbl_status_title)
-        status_layout.addWidget(self.lbl_status, 1)
-        layout.addWidget(status_card)
-        
         layout.addStretch()
     
     def _create_card(self) -> QtWidgets.QFrame:
@@ -189,33 +203,77 @@ class DashboardWidget(QtWidgets.QFrame):
         self.lbl_level.setText(data.get('level', '--'))
         self.lbl_points.setText(str(data.get('total_points', '--')))
         
-        # 任务 / 积分
-        task_cur = int(data.get("task_current", 0) or 0)
-        task_max = int(data.get("task_max", 0) or 0)
+        # 印章奖励
+        stamps = data.get("stamps") if isinstance(data.get("stamps"), dict) else {}
+        sc = stamps.get("current")
+        st = stamps.get("total")
+        sr = stamps.get("reward")
+        if isinstance(sc, int) and isinstance(st, int) and st > 0:
+            self.lbl_stamps.setText(f"{sc} / {st}")
+        elif isinstance(st, int) and st > 0:
+            self.lbl_stamps.setText(f"-- / {st}")
+        else:
+            self.lbl_stamps.setText("-- / --")
+        if isinstance(sr, int) and sr > 0:
+            self.lbl_stamp_reward.setText(f"奖励 {sr:,}")
+        else:
+            self.lbl_stamp_reward.setText("")
+
+        # 连续打卡来源
+        streaks = data.get("streaks") or []
+        by_id = {str(s.get("id")): s for s in streaks if isinstance(s, dict)}
+        goal_cur_sum = 0
+        goal_max_sum = 0
+        for sid, (_name_lbl, day_lbl, goal_lbl) in self.streak_labels.items():
+            s = by_id.get(sid) or {}
+            day = s.get("day")
+            day_total = s.get("day_total")
+            gcur = s.get("goal_cur")
+            gmax = s.get("goal_max")
+            if isinstance(day, int) and isinstance(day_total, int) and day_total > 0:
+                day_lbl.setText(f"第{day}/{day_total}天")
+            else:
+                day_lbl.setText("第--/--天")
+            if isinstance(gcur, int) and isinstance(gmax, int) and gmax > 0:
+                goal_lbl.setText(f"{gcur}/{gmax}")
+                goal_lbl.setStyleSheet(
+                    "color: #81c995; font-size: 12px;" if gcur >= gmax else "color: #8ab4f8; font-size: 12px;"
+                )
+                goal_cur_sum += max(0, gcur)
+                goal_max_sum += max(0, gmax)
+            else:
+                goal_lbl.setText("--/--")
+                goal_lbl.setStyleSheet("color: #8ab4f8; font-size: 12px;")
+
         pc_cur = int(data.get("pc_current", 0) or 0)
         pc_max = int(data.get("pc_max", 0) or 0)
-
-        self.lbl_tasks.setText(f"{task_cur} / {task_max}" if task_max or task_cur else "-- / --")
         self.lbl_today_points.setText(f"{pc_cur} / {pc_max}" if pc_max or pc_cur else "-- / --")
 
-        today_pct = int((task_cur / task_max * 100) if task_max > 0 else 0)
+        if isinstance(sc, int) and isinstance(st, int) and st > 0:
+            today_pct = int(sc / st * 100)
+        elif goal_max_sum > 0:
+            today_pct = int(goal_cur_sum / goal_max_sum * 100)
+        else:
+            task_cur = int(data.get("task_current", 0) or 0)
+            task_max = int(data.get("task_max", 0) or 0)
+            today_pct = int((task_cur / task_max * 100) if task_max > 0 else 0)
         self.progress_today.setValue(today_pct)
         self.progress_today.setFormat(f"{today_pct}%")
-        
-        # 状态
-        status_text = data.get('status', '等待中...')
-        self.lbl_status.setText(status_text)
     
     def clear(self):
         """清空仪表盘"""
         self.lbl_time.setText("当前时间: --:--:--")
         self.lbl_level.setText("--")
         self.lbl_points.setText("--")
-        self.lbl_tasks.setText("-- / --")
+        self.lbl_stamps.setText("-- / --")
+        self.lbl_stamp_reward.setText("")
+        for _name_lbl, day_lbl, goal_lbl in self.streak_labels.values():
+            day_lbl.setText("第--/--天")
+            goal_lbl.setText("--/--")
+            goal_lbl.setStyleSheet("color: #8ab4f8; font-size: 12px;")
         self.lbl_today_points.setText("-- / --")
         self.progress_today.setValue(0)
         self.progress_today.setFormat("0%")
-        self.lbl_status.setText("等待中...")
 
 
 class RewardsGUI(QtWidgets.QMainWindow):
@@ -291,7 +349,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
         self.cb_headless.setChecked(False)
         self.cb_daily = QtWidgets.QCheckBox("每日活动")
         self.cb_daily.setChecked(True)
-        self.cb_daily.setToolTip("自动完成赚取页上的每日/探索类活动（含可跳过拼图）")
+        self.cb_daily.setToolTip("自动完成首页「每日活动」+ 赚取页「日常任务」（仅对应分区内带积分卡片）；拼图类只需打开")
         self.cb_claim = QtWidgets.QCheckBox("自动领取")
         self.cb_claim.setChecked(True)
         self.cb_claim.setToolTip("自动点击仪表盘“可领取/领取”")
@@ -383,7 +441,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
         self.cb_headless.toggled.connect(self._on_headless_changed)
         self.cb_daily.toggled.connect(self._on_task_options_changed)
         self.cb_claim.toggled.connect(self._on_task_options_changed)
-        self.btn_refresh.clicked.connect(self.refresh_accounts)
+        self.btn_refresh.clicked.connect(lambda: self.refresh_accounts(reload_dashboard=True))
         self.btn_add_account.clicked.connect(self.add_account)
         self.btn_delete_account.clicked.connect(self.delete_account)
         self.btn_start.clicked.connect(self.start_task)
@@ -762,11 +820,11 @@ class RewardsGUI(QtWidgets.QMainWindow):
     # endregion
 
     # region 账号列表
-    def refresh_accounts(self):
+    def refresh_accounts(self, reload_dashboard: bool = False):
         prev = self._prefer_account_on_refresh or self._current_selected_account()
         self._prefer_account_on_refresh = None
-        # 允许重新拉取面板数据
-        if prev:
+        # 仅在手动刷新时清空面板缓存；任务启停触发的列表刷新要保留仪表盘，避免点「开始」后数据闪空
+        if reload_dashboard and prev:
             self.dashboard_texts.pop(prev, None)
             self._dashboard_fetching.discard(prev)
 
@@ -943,11 +1001,22 @@ class RewardsGUI(QtWidgets.QMainWindow):
     def _render_dashboard(self, *, account_name: Optional[str] = None, userinfo=None, stats=None, status_text: str = "", search_index=None, search_total=None):
         """构建并发送结构化仪表盘数据"""
         import time as _time
+
+        prev = self.dashboard_texts.get(account_name) if account_name else None
         
         # 若未能识别 firstName，使用 account_name 作为替代显示
         safe_userinfo = dict(userinfo or {})
         if account_name and not safe_userinfo.get("firstName"):
             safe_userinfo["firstName"] = account_name
+
+        # 无新 userinfo 时保留上一帧，只更新时间/状态，避免任务中途刷空
+        if not userinfo and isinstance(prev, dict) and prev:
+            data = dict(prev)
+            data["time"] = _time.strftime("%H:%M:%S")
+            if status_text:
+                data["status"] = status_text
+            self.dashboard_signal.emit(data, account_name)
+            return
 
         # 构建结构化数据
         data = {
@@ -958,6 +1027,8 @@ class RewardsGUI(QtWidgets.QMainWindow):
             "pc_max": 0,
             "task_current": 0,
             "task_max": 0,
+            "streaks": [],
+            "stamps": {},
             "status": status_text or "等待中...",
         }
         
@@ -973,25 +1044,54 @@ class RewardsGUI(QtWidgets.QMainWindow):
             )
             data["total_points"] = int(user_status.get("availablePoints") or 0)
         
-        # 优先使用页面抓取的综合进度（搜索 + 每日活动 + 今日积分/可领取）
+        # 页面抓取进度（连续打卡/印章）；积分字段可能只在完整 scrape 里才有
         progress = safe_userinfo.get("_progress") if isinstance(safe_userinfo, dict) else None
+        has_scrape_points = False
         if isinstance(progress, dict):
-            data["task_current"] = int(progress.get("task_current", 0) or 0)
-            data["task_max"] = int(progress.get("task_max", 0) or 0)
-            data["pc_current"] = int(progress.get("points_current", 0) or 0)
-            data["pc_max"] = int(progress.get("points_max", 0) or 0)
-        elif stats:
+            streaks = progress.get("streaks") or []
+            if isinstance(streaks, list) and streaks:
+                data["streaks"] = streaks
+            stamps = progress.get("stamps")
+            if isinstance(stamps, dict) and stamps:
+                data["stamps"] = stamps
+            if "points_current" in progress or "points_max" in progress:
+                has_scrape_points = True
+                data["pc_current"] = int(progress.get("points_current") or 0)
+                data["pc_max"] = int(progress.get("points_max") or 0)
+            if "task_current" in progress or "task_max" in progress:
+                data["task_current"] = int(progress.get("task_current") or 0)
+                data["task_max"] = int(progress.get("task_max") or 0)
+
+        # API 计数器：用于搜索进度；当没有页面「今日积分」时也作为积分展示
+        if stats and not has_scrape_points:
             data["pc_current"] = int(stats.get("pc", {}).get("current", 0) or 0)
             data["pc_max"] = int(stats.get("pc", {}).get("max", 0) or 0)
             total_searches = int(stats.get("total_searches", 0) or 0)
             remaining = int(stats.get("remaining_searches", 0) or 0)
-            if total_searches > 0:
+            if total_searches > 0 and not data.get("task_max"):
                 data["task_current"] = max(0, total_searches - remaining)
                 data["task_max"] = total_searches
-            else:
-                pps = int(SEARCH_CONFIG.get("points_per_search") or 3)
-                data["task_max"] = (data["pc_max"] + pps - 1) // pps if pps > 0 else 0
-                data["task_current"] = (data["pc_current"] + pps - 1) // pps if pps > 0 else 0
+
+        # API 刷新常没有连续打卡/印章：沿用上一帧；积分有新 stats 时不回退旧值
+        if isinstance(prev, dict):
+            if not data.get("streaks") and prev.get("streaks"):
+                data["streaks"] = prev.get("streaks") or []
+            prev_stamps = prev.get("stamps") if isinstance(prev.get("stamps"), dict) else {}
+            cur_stamps = data.get("stamps") if isinstance(data.get("stamps"), dict) else {}
+            if prev_stamps and (
+                not cur_stamps
+                or (cur_stamps.get("current") is None and prev_stamps.get("current") is not None)
+            ):
+                merged = dict(prev_stamps)
+                merged.update({k: v for k, v in cur_stamps.items() if v is not None})
+                data["stamps"] = merged
+            if data.get("level") in (None, "", "--", "未知") and prev.get("level") not in (None, "", "--"):
+                data["level"] = prev.get("level")
+            if not data.get("total_points") and prev.get("total_points"):
+                data["total_points"] = prev.get("total_points")
+            if not has_scrape_points and not stats and not data.get("pc_max") and prev.get("pc_max"):
+                data["pc_current"] = prev.get("pc_current", 0)
+                data["pc_max"] = prev.get("pc_max", 0)
 
         self.dashboard_signal.emit(data, account_name)
 
@@ -1183,8 +1283,10 @@ class RewardsGUI(QtWidgets.QMainWindow):
             search_total=None,
         )
         
-        # 启动周期性真实数据刷新任务（仅更新显示）
-        refresh_task = asyncio.create_task(self._periodic_dashboard_refresh(context, device_type, account_name, task_name, interval=0.1))
+        # 周期性刷新（不带 page，避免打断领取/活动）；缺连续打卡字段时由 _render_dashboard 保留上一帧
+        refresh_task = asyncio.create_task(
+            self._periodic_dashboard_refresh(context, device_type, account_name, task_name, interval=5.0)
+        )
 
         def _should_stop() -> bool:
             return self._should_stop(task_name, account_name)
