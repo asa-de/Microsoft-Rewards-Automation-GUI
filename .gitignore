@@ -364,3 +364,7 @@ FodyWeavers.xsd
 
 # Local account sessions / cookies (do not publish)
 Assets/cookies/
+
+# Local Android platform-tools (download separately)
+Assets/platform-tools/
+Assets/platform-tools-windows.zip
