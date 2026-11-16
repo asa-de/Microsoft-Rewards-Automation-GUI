@@ -36,6 +36,7 @@ from main import (
     read_account_meta,
 )
 from activities import claim_available_rewards, complete_daily_activities
+from adb_bing import complete_bing_app_checkin
 
 # Playwright 异步 API（用于浏览器自动化）
 from playwright.async_api import async_playwright
@@ -281,6 +282,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
         self.headless_mode = False
         self.enable_daily_activities = True
         self.enable_auto_claim = True
+        self.enable_adb_bing_app = True
 
         # 选中账号
         self.selected_cookie: Optional[Path] = None
@@ -315,9 +317,15 @@ class RewardsGUI(QtWidgets.QMainWindow):
         self.cb_claim = QtWidgets.QCheckBox("自动领取")
         self.cb_claim.setChecked(True)
         self.cb_claim.setToolTip("自动点击仪表盘“可领取/领取”")
+        self.cb_adb_app = QtWidgets.QCheckBox("应用签到(ADB)")
+        self.cb_adb_app.setChecked(True)
+        self.cb_adb_app.setToolTip(
+            "通过已连接安卓真机的必应 App 完成「应用」连续打卡（Intent 搜索，无需模拟点击）"
+        )
         opts.addWidget(self.cb_headless)
         opts.addWidget(self.cb_daily)
         opts.addWidget(self.cb_claim)
+        opts.addWidget(self.cb_adb_app)
         opts.addStretch(1)
 
         # 按钮区
@@ -403,6 +411,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
         self.cb_headless.toggled.connect(self._on_headless_changed)
         self.cb_daily.toggled.connect(self._on_task_options_changed)
         self.cb_claim.toggled.connect(self._on_task_options_changed)
+        self.cb_adb_app.toggled.connect(self._on_task_options_changed)
         self.btn_refresh.clicked.connect(lambda: self.refresh_accounts(reload_dashboard=True))
         self.btn_add_account.clicked.connect(self.add_account)
         self.btn_delete_account.clicked.connect(self.delete_account)
@@ -762,8 +771,10 @@ class RewardsGUI(QtWidgets.QMainWindow):
                 self.cb_headless.setChecked(self.headless_mode)
                 self.enable_daily_activities = bool(cfg.get("daily_activities", True))
                 self.enable_auto_claim = bool(cfg.get("auto_claim", True))
+                self.enable_adb_bing_app = bool(cfg.get("adb_bing_app", True))
                 self.cb_daily.setChecked(self.enable_daily_activities)
                 self.cb_claim.setChecked(self.enable_auto_claim)
+                self.cb_adb_app.setChecked(self.enable_adb_bing_app)
         except Exception as e:
             self.log_signal.emit(f"读取配置失败: {e}", "ERROR")
 
@@ -774,6 +785,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
                 "headless": self.headless_mode,
                 "daily_activities": self.enable_daily_activities,
                 "auto_claim": self.enable_auto_claim,
+                "adb_bing_app": self.enable_adb_bing_app,
             }
             self.config_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
@@ -1283,6 +1295,17 @@ class RewardsGUI(QtWidgets.QMainWindow):
                 except Exception:
                     pass
 
+        # 2.5) 真机必应「应用」签到（ADB Intent，不依赖模拟点击）
+        if self.enable_adb_bing_app and not _should_stop():
+            try:
+                await complete_bing_app_checkin(
+                    searches=3,
+                    log=_task_log,
+                    should_stop=_should_stop,
+                )
+            except Exception as e:
+                self.log_signal.emit(f"{prefix}ADB 应用签到失败: {e}", "WARN")
+
         # 3) 搜索任务（若仍有剩余）
         need_search = total > 0 and remaining > 0 and stats.get("max_points", 0) > 0
         if not need_search:
@@ -1473,6 +1496,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
     def _on_task_options_changed(self, _checked: bool):
         self.enable_daily_activities = self.cb_daily.isChecked()
         self.enable_auto_claim = self.cb_claim.isChecked()
+        self.enable_adb_bing_app = self.cb_adb_app.isChecked()
         self.save_config()
 
     # Qt 生命周期

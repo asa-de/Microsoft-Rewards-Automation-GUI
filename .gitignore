@@ -368,3 +368,7 @@ Assets/cookies/
 # Local Android platform-tools (download separately)
 Assets/platform-tools/
 Assets/platform-tools-windows.zip
+
+# Local ADB/UI probe dumps
+Assets/_bing_*.xml
+Assets/_inspect/
