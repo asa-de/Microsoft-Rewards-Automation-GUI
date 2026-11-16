@@ -320,7 +320,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
         self.cb_adb_app = QtWidgets.QCheckBox("应用签到(ADB)")
         self.cb_adb_app.setChecked(True)
         self.cb_adb_app.setToolTip(
-            "通过已连接安卓真机的必应 App 完成「应用」连续打卡（Intent 搜索，无需模拟点击）"
+            "真机必应：切换到当前账号（需已在 App 预登录）并点击「签入」；需开启 USB 调试（安全设置）"
         )
         opts.addWidget(self.cb_headless)
         opts.addWidget(self.cb_daily)
@@ -1295,11 +1295,11 @@ class RewardsGUI(QtWidgets.QMainWindow):
                 except Exception:
                     pass
 
-        # 2.5) 真机必应「应用」签到（ADB Intent，不依赖模拟点击）
+        # 2.5) 真机必应「应用」签到：先切到当前 cookie 对应已保存账号，再点签入
         if self.enable_adb_bing_app and not _should_stop():
             try:
                 await complete_bing_app_checkin(
-                    searches=3,
+                    account_email=account_name,
                     log=_task_log,
                     should_stop=_should_stop,
                 )
