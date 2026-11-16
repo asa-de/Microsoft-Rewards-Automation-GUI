@@ -1,7 +1,8 @@
-﻿import asyncio
+import asyncio
 import json
 import os
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -361,11 +362,141 @@ def generate_random_query() -> str:
     return f"{keyword} {random_string}"
 
 
-async def fetch_rewards_userinfo(context, *, timeout_ms: int = 15000):
+def prepare_cookies_for_playwright(cookies: list) -> list:
+    """清理/规范化 Cookie，避免 Playwright add_cookies / storage_state 注入失败。
+
+    Playwright 约束：cookie 只能是 url，或 domain+path，二者不能混用。
+    """
+    prepared: list[dict] = []
+    for raw in cookies or []:
+        if not isinstance(raw, dict) or not raw.get("name"):
+            continue
+        item = {k: v for k, v in raw.items() if k not in {"partitionKey", "_crHasCrossSiteAncestor"}}
+        name = str(item.get("name") or "")
+        same_site = item.get("sameSite")
+        if same_site not in ("Strict", "Lax", "None"):
+            item.pop("sameSite", None)
+
+        # __Host- / __Secure-：优先用 url（不能同时带 path/domain）
+        if name.startswith("__Host-") or name.startswith("__Secure-"):
+            domain = str(item.pop("domain", "") or "").lstrip(".")
+            item.pop("path", None)
+            item["secure"] = True
+            item["url"] = f"https://{domain}/" if domain else "https://login.live.com/"
+        elif item.get("url"):
+            # 有 url 时去掉 domain/path，避免 “either url or path” 报错
+            item.pop("domain", None)
+            item.pop("path", None)
+        elif item.get("domain"):
+            if not item.get("path"):
+                item["path"] = "/"
+        else:
+            item["url"] = "https://rewards.bing.com/"
+
+        # Playwright: session cookie 用 -1；非法值直接去掉让其成为 session
+        exp = item.get("expires")
+        if exp is not None:
+            try:
+                exp_f = float(exp)
+                if exp_f > 0 and exp_f < 10_000_000_000:
+                    item["expires"] = exp_f
+                elif exp_f <= 0:
+                    item["expires"] = -1
+                else:
+                    item.pop("expires", None)
+            except Exception:
+                item.pop("expires", None)
+
+        prepared.append(item)
+    return prepared
+
+
+def load_auth_state(path: Path) -> dict:
+    """读取账号会话文件，兼容旧版纯 cookie 数组与 Playwright storage_state。"""
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(data, list):
+        return {"cookies": prepare_cookies_for_playwright(data), "origins": []}
+    if isinstance(data, dict):
+        cookies = data.get("cookies") or []
+        origins = data.get("origins") or []
+        return {
+            "cookies": prepare_cookies_for_playwright(cookies),
+            "origins": origins,
+        }
+    raise ValueError(f"无法识别的会话文件格式: {path}")
+
+
+async def apply_auth_state(context, path: Path) -> None:
+    """把会话文件注入到已有 BrowserContext。"""
+    state = load_auth_state(path)
+    cookies = state.get("cookies") or []
+    if cookies:
+        await context.add_cookies(cookies)
+
+
+async def save_auth_state(context, path: Path) -> None:
+    """保存完整 storage_state（cookies + origins）。
+
+    落盘保持 Playwright 原始格式；加载时再做兼容规范化。
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    state = await context.storage_state()
+    path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+async def fetch_rewards_userinfo(context, *, timeout_ms: int = 15000, page=None):
     """从 Rewards API 拉取用户信息（使用当前 context 的 Cookie 身份）。
 
-    增加 timeout 以避免网络抖动时请求悬挂导致界面“卡住”。
+    优先走页面内 fetch（带上浏览器真实 Cookie，含分区 Cookie），
+    避免 context.request 出现“页面已登录但 API 401”的情况。
     """
+    if page is not None:
+        try:
+            cur = ""
+            try:
+                cur = page.url or ""
+            except Exception:
+                cur = ""
+            if "rewards.bing.com" not in cur:
+                await page.goto(
+                    "https://rewards.bing.com/",
+                    wait_until=DOMCONTENTLOADED,
+                    timeout=min(timeout_ms, 60000),
+                )
+                await page.wait_for_timeout(800)
+        except Exception:
+            pass
+
+        page_err = None
+        try:
+            data = await page.evaluate(
+                """async () => {
+                    const ts = Date.now();
+                    const url = `https://rewards.bing.com/api/getuserinfo?type=1&X-Requested-With=XMLHttpRequest&_=${ts}`;
+                    const resp = await fetch(url, {
+                        method: 'GET',
+                        credentials: 'include',
+                        headers: {
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'Accept': 'application/json, text/plain, */*',
+                        },
+                    });
+                    if (!resp.ok) {
+                        throw new Error(`${resp.status} ${resp.statusText}`);
+                    }
+                    return await resp.json();
+                }"""
+            )
+            if isinstance(data, dict):
+                return data
+            raise RuntimeError("Rewards API 返回了非 JSON 对象")
+        except Exception as e:
+            # 回退到 context.request
+            page_err = e
+    else:
+        page_err = None
+
     timestamp = int(time.time() * 1000)
     url = f"{REWARDS_API_URL}&_={timestamp}"
 
@@ -374,15 +505,163 @@ async def fetch_rewards_userinfo(context, *, timeout_ms: int = 15000):
             url,
             headers={
                 "X-Requested-With": "XMLHttpRequest",
+                "Referer": "https://rewards.bing.com/",
+                "Accept": "application/json, text/plain, */*",
             },
             timeout=timeout_ms,
         )
     except Exception as e:
-        raise RuntimeError(f"Rewards API 请求超时/失败: {e}") from e
+        detail = f"{e}"
+        if page_err is not None:
+            detail = f"page_fetch={page_err}; request={e}"
+        raise RuntimeError(f"Rewards API 请求超时/失败: {detail}") from e
 
     if not resp.ok:
-        raise RuntimeError(f"Rewards API 请求失败: {resp.status} {resp.status_text}")
+        detail = f"{resp.status} {resp.status_text}"
+        if page_err is not None:
+            detail = f"page_fetch={page_err}; request={detail}"
+        # 新版 Rewards（Next.js）常对 getuserinfo 返回 401，但页面本身已登录；
+        # 有 page 时回退到 DOM/RSC 抓取，避免面板空白。
+        if page is not None and resp.status in (401, 403, 404):
+            try:
+                return await scrape_rewards_userinfo_from_page(page)
+            except Exception as scrape_err:
+                raise RuntimeError(
+                    f"Rewards API 请求失败: {detail}; scrape={scrape_err}"
+                ) from scrape_err
+        raise RuntimeError(f"Rewards API 请求失败: {detail}")
     return await resp.json()
+
+
+def _parse_balance_level_from_html(html: str) -> tuple[int | None, int | None]:
+    if not html:
+        return None, None
+    m = re.search(r'\\*"balance\\*"\s*:\s*(\d+)\s*,\s*\\*"level\\*"\s*:\s*(\d+)', html)
+    if not m:
+        m = re.search(r'"balance"\s*:\s*(\d+)\s*,\s*"level"\s*:\s*(\d+)', html)
+    if not m:
+        return None, None
+    return int(m.group(1)), int(m.group(2))
+
+
+async def scrape_rewards_userinfo_from_page(page) -> dict:
+    """从新版 Rewards 页面抓取积分信息，构造与旧 getuserinfo 近似的结构。"""
+    # 统一落到 dashboard，并重试等待前端渲染出积分
+    last_url = ""
+    balance = None
+    level_num = None
+    scraped = {
+        "pointsText": None,
+        "levelText": None,
+        "searchDone": None,
+        "searchTotal": None,
+        "title": "",
+        "url": "",
+    }
+
+    for attempt in range(5):
+        try:
+            cur = page.url or ""
+        except Exception:
+            cur = ""
+        if "/dashboard" not in cur or "rewards.bing.com" not in cur:
+            await page.goto(
+                "https://rewards.bing.com/dashboard",
+                wait_until=DOMCONTENTLOADED,
+                timeout=60000,
+            )
+        elif attempt > 0:
+            try:
+                await page.reload(wait_until=DOMCONTENTLOADED, timeout=60000)
+            except Exception:
+                pass
+
+        await page.wait_for_timeout(1000 + attempt * 700)
+
+        html = ""
+        try:
+            html = await page.content()
+        except Exception:
+            html = ""
+        balance, level_num = _parse_balance_level_from_html(html)
+
+        scraped = await page.evaluate(
+            """() => {
+              const body = (document.body && document.body.innerText) || '';
+              const pointsMatch =
+                body.match(/可用积分[^\\d]{0,40}([\\d,]{2,})/) ||
+                body.match(/([\\d,]{2,})\\s*兑换/);
+              const levelMatch = body.match(/金牌会员|银牌会员|会员/);
+              const searchMatch = body.match(/搜索:\\s*(\\d+)\\s*\\/\\s*(\\d+)/);
+              return {
+                pointsText: pointsMatch ? pointsMatch[1].replace(/,/g, '') : null,
+                levelText: levelMatch ? levelMatch[0] : null,
+                searchDone: searchMatch ? Number(searchMatch[1]) : null,
+                searchTotal: searchMatch ? Number(searchMatch[2]) : null,
+                title: document.title || '',
+                url: location.href || '',
+                hasRewardsTitle: /Microsoft Rewards|积分商城/.test(document.title || ''),
+              };
+            }"""
+        )
+        last_url = scraped.get("url") or cur
+
+        if balance is None and scraped.get("pointsText"):
+            try:
+                balance = int(str(scraped["pointsText"]).replace(",", ""))
+            except Exception:
+                balance = None
+
+        if balance is not None:
+            break
+
+    if balance is None:
+        raise RuntimeError(f"页面已打开但未能解析可用积分 ({last_url or 'unknown'})")
+
+    level_name = scraped.get("levelText") or "未知"
+    if not scraped.get("levelText") and level_num is not None:
+        level_name = {1: "会员", 2: "银牌会员", 3: "金牌会员"}.get(level_num, f"Level{level_num}")
+
+    search_done = scraped.get("searchDone")
+    search_total = scraped.get("searchTotal")
+    points_per_search = int(SEARCH_CONFIG.get("points_per_search") or 3)
+    if isinstance(search_done, int) and isinstance(search_total, int) and search_total >= 0:
+        pc_current = max(0, search_done) * points_per_search
+        pc_max = max(0, search_total) * points_per_search
+    else:
+        pc_current = 0
+        pc_max = 0
+
+    active_level = f"newLevel{level_num}" if level_num else level_name
+    return {
+        "dashboard": {
+            "userStatus": {
+                "availablePoints": balance,
+                "isRewardsUser": True,
+                "levelInfo": {
+                    "activeLevel": active_level,
+                    "activeLevelName": level_name,
+                    "level": level_num,
+                },
+                "counters": {
+                    "pcSearch": [
+                        {
+                            "pointProgress": pc_current,
+                            "pointProgressMax": pc_max,
+                            "pointMax": pc_max,
+                        }
+                    ],
+                    "mobileSearch": [],
+                },
+            }
+        },
+        "isRewardsUser": True,
+        "_source": "page_scrape",
+        "_page": {
+            "title": scraped.get("title"),
+            "url": scraped.get("url") or last_url,
+        },
+    }
 
 
 def _sum_counter_points(counter_items):
@@ -996,14 +1275,17 @@ async def login_and_save():
                 print("\n警告: 未能检测到账户名，使用默认名称")
 
             account_name = _sanitize_filename(account_name)
-            
-            cookies = await context.cookies()
+
+            # 保存前确认 Rewards API 可用，避免写入半成品会话
+            try:
+                await fetch_rewards_userinfo(context, timeout_ms=20000, page=page)
+            except Exception as e:
+                print(f"\n错误: Rewards API 不可用，未保存会话: {e}")
+                return
+
             cookie_file = cookies_dir / f"{account_name}.json"
-            
-            with open(cookie_file, 'w', encoding='utf-8') as f:
-                json.dump(cookies, f, ensure_ascii=False, indent=2)
-            
-            print(f"Cookie已保存到: {cookie_file}")
+            await save_auth_state(context, cookie_file)
+            print(f"会话已保存到: {cookie_file}")
             await asyncio.sleep(1)
             
         except Exception as e:
@@ -1024,9 +1306,12 @@ async def use_saved_cookie():
         print("\n操作已取消")
         return
     
-    # 加载cookie
-    with open(cookie_file, 'r', encoding='utf-8') as f:
-        cookies = json.load(f)
+    # 加载会话（兼容旧 cookie 数组与 storage_state）
+    try:
+        storage_state = load_auth_state(cookie_file)
+    except Exception as e:
+        print(f"\n读取会话失败: {e}")
+        return
     
     device_type = "windows"
     user_agent = USER_AGENTS[device_type]
@@ -1083,10 +1368,8 @@ async def use_saved_cookie():
             context_kwargs["locale"] = "zh-CN"
             context_kwargs["timezone_id"] = "Asia/Shanghai"
 
+        context_kwargs["storage_state"] = storage_state
         context = await browser.new_context(**context_kwargs)
-        
-        # 添加cookies
-        await context.add_cookies(cookies)
         
         page = await context.new_page()
         

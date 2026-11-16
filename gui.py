@@ -30,6 +30,8 @@ from main import (
     _format_console_dashboard,
     BROWSER_CHANNEL,
     DOMCONTENTLOADED,
+    load_auth_state,
+    save_auth_state,
 )
 
 # Playwright 异步 API（用于浏览器自动化）
@@ -232,6 +234,8 @@ class RewardsGUI(QtWidgets.QMainWindow):
         self.account_status: Dict[str, str] = {}
         # 各账号对应的最新仪表盘数据
         self.dashboard_texts: Dict[str, dict] = {}
+        # 正在后台拉取仪表盘的账号，避免重复启动浏览器
+        self._dashboard_fetching: set[str] = set()
 
         # 配置与设备选择
         self.config_path = Path("Assets/config.json")
@@ -241,6 +245,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
 
         # 选中账号
         self.selected_cookie: Optional[Path] = None
+        self._prefer_account_on_refresh: Optional[str] = None
 
         self._build_ui()
         self._connect_signals()
@@ -425,9 +430,9 @@ class RewardsGUI(QtWidgets.QMainWindow):
         names = {c.get("name") for c in cookies}
         return bool(names & self._AUTH_COOKIE_NAMES)
 
-    async def _userinfo_indicates_login(self, context) -> bool:
+    async def _userinfo_indicates_login(self, context, page=None) -> bool:
         try:
-            userinfo = await fetch_rewards_userinfo(context, timeout_ms=8000)
+            userinfo = await fetch_rewards_userinfo(context, timeout_ms=8000, page=page)
             dashboard = userinfo.get("dashboard") or userinfo
             user_status = (dashboard or {}).get("userStatus") or {}
             return (
@@ -438,6 +443,17 @@ class RewardsGUI(QtWidgets.QMainWindow):
             )
         except Exception:
             return False
+
+    def _is_rewards_home_url(self, url: str) -> bool:
+        u = url or ""
+        if "rewards.bing.com" not in u:
+            return False
+        if self._is_login_host(u):
+            return False
+        # 仅排除明确未完成登录的入口；/about、/dashboard、/ 都视为已进入 Rewards
+        if any(x in u for x in ("/signin", "/auth/login", "/auth/callback")):
+            return False
+        return True
 
     async def _page_looks_logged_in(self, page) -> bool:
         try:
@@ -566,7 +582,10 @@ class RewardsGUI(QtWidgets.QMainWindow):
         cookies_dir.mkdir(parents=True, exist_ok=True)
         
         async with async_playwright() as p:
-            browser = await p.chromium.launch(channel=BROWSER_CHANNEL, headless=False)
+            browser = await p.chromium.launch(
+                channel=BROWSER_CHANNEL,
+                headless=False,
+            )
             context = await browser.new_context()
             page = await context.new_page()
             
@@ -579,7 +598,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
                 )
                 
                 self.log_signal.emit(
-                    "请在弹出的 Chrome 中完成登录；看到 Rewards 主页后保持几秒，程序会自动保存",
+                    "请在弹出的 Chrome 中完成登录；进入 Rewards 主页后会直接保存当前 Cookie",
                     "INFO",
                 )
 
@@ -588,6 +607,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
                 stable_since = None
                 last_status_log = 0.0
                 navigated_after_auth = False
+                last_api_probe = 0.0
 
                 while time.time() < deadline:
                     pages = await self._active_pages(context, page)
@@ -595,7 +615,6 @@ class RewardsGUI(QtWidgets.QMainWindow):
                         self.log_signal.emit("浏览器窗口已关闭，添加账号已取消", "WARN")
                         return
 
-                    # 优先检查所有标签页
                     current = pages[-1]
                     urls = []
                     for pg in pages:
@@ -628,24 +647,25 @@ class RewardsGUI(QtWidgets.QMainWindow):
                         except Exception as e:
                             self.log_signal.emit(f"跳转 Rewards 失败: {e}", "WARN")
 
-                    # 任一标签满足登录条件，或 Rewards 页面稳定停留
                     ok = False
-                    for pg in pages:
-                        if await self._is_rewards_logged_in(pg, context):
-                            current = pg
-                            ok = True
-                            break
+                    # 1) 页面内 API（真实 Cookie）成功
+                    if now - last_api_probe >= 4:
+                        last_api_probe = now
+                        for pg in pages:
+                            if self._is_rewards_home_url(getattr(pg, "url", "") or ""):
+                                if await self._userinfo_indicates_login(context, page=pg):
+                                    current = pg
+                                    ok = True
+                                    break
+                            if await self._page_looks_logged_in(pg):
+                                current = pg
 
-                    on_rewards = any(
-                        ("rewards.bing.com" in u)
-                        and ("/signin" not in u)
-                        and ("/auth/login" not in u)
-                        and (not self._is_login_host(u))
-                        for u in urls
-                    )
-                    if on_rewards and await self._has_auth_cookies(context):
+                    # 2) 已稳定停留在 Rewards 主页：直接采用当前浏览器 Cookie（按你的要求）
+                    on_rewards = any(self._is_rewards_home_url(u) for u in urls)
+                    if on_rewards:
                         if stable_since is None:
                             stable_since = now
+                            self.log_signal.emit("已进入 Rewards 页面，确认停留后保存 Cookie...", "INFO")
                         elif now - stable_since >= 5:
                             ok = True
                     else:
@@ -656,29 +676,48 @@ class RewardsGUI(QtWidgets.QMainWindow):
                         logged_in = True
                         break
 
-                    await asyncio.sleep(1.5)
+                    await asyncio.sleep(1.0)
 
                 if not logged_in:
                     self.log_signal.emit("登录超时或已取消", "WARN")
                     return
 
-                self.log_signal.emit("已检测到登录态，正在保存 Cookie...", "INFO")
-                # 确保落在 Rewards 域再取 Cookie/账户名
+                self.log_signal.emit("正在保存当前浏览器登录 Cookie...", "INFO")
+                # 保存前先进入 dashboard，确保会话落在可用页面
                 try:
-                    if "rewards.bing.com" not in (page.url or ""):
-                        await page.goto(
-                            "https://rewards.bing.com/",
-                            wait_until=DOMCONTENTLOADED,
-                            timeout=60000,
-                        )
+                    await page.goto(
+                        "https://rewards.bing.com/dashboard",
+                        wait_until=DOMCONTENTLOADED,
+                        timeout=60000,
+                    )
+                    await page.wait_for_timeout(1500)
                 except Exception:
                     pass
 
                 account_name = _sanitize_filename(await self._extract_account_name(page, context))
-                cookies = await context.cookies()
                 cookie_file = cookies_dir / f"{account_name}.json"
-                cookie_file.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
-                self.log_signal.emit(f"Cookie已保存: {account_name}", "SUCCESS")
+                await save_auth_state(context, cookie_file)
+                self.log_signal.emit(f"会话已保存: {account_name}", "SUCCESS")
+                self._prefer_account_on_refresh = account_name
+
+                # 面板数据尽量刷新；失败也不回滚已保存的 Cookie
+                try:
+                    userinfo_ok = await fetch_rewards_userinfo(context, timeout_ms=20000, page=page)
+                    stats = compute_remaining_searches(userinfo_ok, "windows")
+                    remaining = stats.get("remaining_searches", 0)
+                    self._render_dashboard(
+                        account_name=account_name,
+                        userinfo=userinfo_ok,
+                        stats=stats,
+                        status_text=f"剩余 {remaining} 次",
+                    )
+                    src = userinfo_ok.get("_source") if isinstance(userinfo_ok, dict) else None
+                    suffix = "（页面抓取）" if src == "page_scrape" else ""
+                    self.log_signal.emit(f"已刷新账号面板: {account_name}{suffix}", "SUCCESS")
+                except Exception as e:
+                    self.log_signal.emit(f"Cookie 已保存，但面板刷新失败: {e}", "WARN")
+                    # 留给后续选中账号时的后台加载再试一次
+                    self.dashboard_texts.pop(account_name, None)
                 
             except Exception as e:
                 self.log_signal.emit(f"登录失败: {str(e)}", "ERROR")
@@ -760,13 +799,20 @@ class RewardsGUI(QtWidgets.QMainWindow):
 
     # region 账号列表
     def refresh_accounts(self):
+        prev = self._prefer_account_on_refresh or self._current_selected_account()
+        self._prefer_account_on_refresh = None
+        # 允许重新拉取面板数据
+        if prev:
+            self.dashboard_texts.pop(prev, None)
+            self._dashboard_fetching.discard(prev)
         self.accounts_list.clear()
         try:
             # 与原始逻辑保持一致：内部自动从可写目录/资源目录查找
             files = get_cookie_files()
         except Exception:
             files = sorted(self.cookies_dir.glob("*.json"))
-        for f in files:
+        selected_row = 0
+        for idx, f in enumerate(files):
             # 统一计算/同步状态
             self._recompute_account_status(f.stem)
             status = self.account_status.get(f.stem) or "空闲"
@@ -781,6 +827,17 @@ class RewardsGUI(QtWidgets.QMainWindow):
                 if "运行中" in status:
                     item.setForeground(QtGui.QBrush(QtGui.QColor("#2e7d32")))
             self.accounts_list.addItem(item)
+            if prev and f.stem == prev:
+                selected_row = idx
+
+        if self.accounts_list.count() > 0:
+            self.accounts_list.setCurrentRow(selected_row)
+            item = self.accounts_list.currentItem()
+            if item:
+                self._ensure_dashboard_for_account(
+                    item.text(),
+                    Path(item.data(QtCore.Qt.ItemDataRole.UserRole)),
+                )
 
     # endregion
 
@@ -830,8 +887,72 @@ class RewardsGUI(QtWidgets.QMainWindow):
         else:
             self.dashboard.clear()
 
-    def _on_account_selection_changed(self, _current, _previous):
+    def _on_account_selection_changed(self, current, _previous):
         self._show_dashboard_for_selected()
+        if not current:
+            return
+        cookie_path = Path(current.data(QtCore.Qt.ItemDataRole.UserRole))
+        self._ensure_dashboard_for_account(current.text(), cookie_path)
+
+    def _ensure_dashboard_for_account(self, account_name: str, cookie_path: Path):
+        """选中账号后若还没有面板数据，则后台拉取一次 Rewards 信息。"""
+        if not account_name or not cookie_path:
+            return
+        if account_name in self.dashboard_texts:
+            return
+        if account_name in self._dashboard_fetching:
+            return
+        if not cookie_path.exists():
+            return
+        self._dashboard_fetching.add(account_name)
+        self.log_signal.emit(f"正在加载账号面板数据: {account_name}", "INFO")
+        th = threading.Thread(
+            target=self._run_dashboard_fetch_thread,
+            args=(account_name, cookie_path),
+            daemon=True,
+        )
+        th.start()
+
+    def _run_dashboard_fetch_thread(self, account_name: str, cookie_path: Path):
+        try:
+            asyncio.run(self._fetch_dashboard_async(account_name, cookie_path))
+        except Exception as e:
+            self.log_signal.emit(f"加载面板失败: {e}", "ERROR")
+        finally:
+            self._dashboard_fetching.discard(account_name)
+
+    async def _fetch_dashboard_async(self, account_name: str, cookie_path: Path):
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(channel=BROWSER_CHANNEL, headless=True)
+            try:
+                state = load_auth_state(cookie_path)
+                context = await browser.new_context(storage_state=state)
+                page = await context.new_page()
+                await page.goto(
+                    "https://rewards.bing.com/dashboard",
+                    wait_until=DOMCONTENTLOADED,
+                    timeout=60000,
+                )
+                await page.wait_for_timeout(1200)
+                userinfo = await fetch_rewards_userinfo(context, timeout_ms=20000, page=page)
+                stats = compute_remaining_searches(userinfo, "windows")
+                remaining = stats.get("remaining_searches", 0)
+                self._render_dashboard(
+                    account_name=account_name,
+                    userinfo=userinfo,
+                    stats=stats,
+                    status_text=f"剩余 {remaining} 次",
+                )
+                src = userinfo.get("_source") if isinstance(userinfo, dict) else None
+                suffix = "（页面抓取）" if src == "page_scrape" else ""
+                self.log_signal.emit(f"面板已更新: {account_name}{suffix}", "SUCCESS")
+            except Exception as e:
+                self.log_signal.emit(f"无法获取面板数据: {e}", "ERROR")
+            finally:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
 
     def _render_dashboard(self, *, account_name: Optional[str] = None, userinfo=None, stats=None, status_text: str = "", search_index=None, search_total=None):
         """构建并发送结构化仪表盘数据"""
@@ -856,7 +977,12 @@ class RewardsGUI(QtWidgets.QMainWindow):
             dashboard_info = safe_userinfo.get("dashboard") or safe_userinfo
             user_status = (dashboard_info or {}).get("userStatus") or {}
             level_info = user_status.get("levelInfo") or {}
-            data["level"] = level_info.get("activeLevel") or level_info.get("level") or "未知"
+            data["level"] = (
+                level_info.get("activeLevelName")
+                or level_info.get("activeLevel")
+                or level_info.get("level")
+                or "未知"
+            )
             data["total_points"] = int(user_status.get("availablePoints") or 0)
         
         if stats:
@@ -996,14 +1122,11 @@ class RewardsGUI(QtWidgets.QMainWindow):
             launch_kwargs = {"channel": BROWSER_CHANNEL, "headless": self.headless_mode}
             browser = await p.chromium.launch(**launch_kwargs)
             ctx_kwargs = self._context_kwargs(p, device_type, user_agent)
-            context = await browser.new_context(**ctx_kwargs)
-            # 加载 cookie JSON 并注入
             try:
-                cookies = json.loads(Path(cookie_file).read_text(encoding="utf-8"))
-                if isinstance(cookies, list) and cookies:
-                    await context.add_cookies(cookies)
+                ctx_kwargs["storage_state"] = load_auth_state(cookie_file)
             except Exception:
                 pass
+            context = await browser.new_context(**ctx_kwargs)
             page = await context.new_page()
             
             try:
