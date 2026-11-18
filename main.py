@@ -669,9 +669,9 @@ async def save_account_session(context, cookies_dir: Path, account: dict) -> tup
 
 
 
-_earn_progress_cache: dict = {"ts": 0.0, "data": None, "ver": 4}
+_earn_progress_cache: dict = {"ts": 0.0, "data": None, "ver": 5}
 _EARN_PROGRESS_TTL_SEC = 45.0
-_EARN_PROGRESS_VER = 4
+_EARN_PROGRESS_VER = 5
 
 
 def _normalize_streaks(raw_streaks) -> list:
@@ -859,24 +859,57 @@ async def scrape_earn_page_progress(page, *, force: bool = False) -> dict:
                 }
               }
 
-              // 印章：奖励/总数用文案；已得数量优先数圆形槽位，再用 HTML 字段兜底
+              // 印章：进行中是「赚取 N 个印章」+ 圆点网格；集齐后网格空白，文案变
+              // 「很好。已收集所有 12 个印章，赚取了 1,000 点奖励积分。」
               const stamps = { current: null, total: null, reward: null };
-              const totalM = body.match(/赚取\\s*(\\d+)\\s*个印章/);
+              const totalM =
+                body.match(/已收集所有\\s*(\\d+)\\s*个印章/) ||
+                body.match(/赚取\\s*(\\d+)\\s*个印章/) ||
+                body.match(/(\\d+)\\s*个印章/);
               if (totalM) stamps.total = Number(totalM[1]);
+
+              // 集齐完成态：优先直接记满
+              const doneStamp =
+                body.match(/已收集所有\\s*(\\d+)\\s*个印章/) ||
+                body.match(/很好[。.\\s]*已收集所有\\s*(\\d+)\\s*个印章/);
+              if (doneStamp) {
+                const n = Number(doneStamp[1]);
+                if (Number.isFinite(n) && n > 0) {
+                  stamps.current = n;
+                  stamps.total = n;
+                }
+                const rewarded = body.match(/赚取了\\s*([\\d,]+)\\s*点/);
+                if (rewarded) stamps.reward = Number(String(rewarded[1]).replace(/,/g, ''));
+              }
+
               let stampCard = null;
               let stampCardScore = 1e9;
               for (const el of document.querySelectorAll('a, div, section, article')) {
                 const t = norm(el.innerText || '');
-                if (!/个印章/.test(t) || !/奖励/.test(t)) continue;
+                if (!/个印章/.test(t)) continue;
+                if (!/(奖励|已收集所有|赚取)/.test(t)) continue;
                 if (t.length < 8 || t.length > 420) continue;
                 if (t.length < stampCardScore) {
                   stampCard = el;
                   stampCardScore = t.length;
-                  const rm = t.match(/([\\d,]+)\\s*奖励/);
+                  const rm =
+                    t.match(/([\\d,]+)\\s*奖励/) ||
+                    t.match(/赚取了\\s*([\\d,]+)\\s*点/);
                   if (rm) stamps.reward = Number(String(rm[1]).replace(/,/g, ''));
                   if (!stamps.total) {
-                    const tm = t.match(/赚取\\s*(\\d+)\\s*个印章/);
+                    const tm =
+                      t.match(/已收集所有\\s*(\\d+)\\s*个印章/) ||
+                      t.match(/赚取\\s*(\\d+)\\s*个印章/) ||
+                      t.match(/(\\d+)\\s*个印章/);
                     if (tm) stamps.total = Number(tm[1]);
+                  }
+                  // 卡内完成文案
+                  if (stamps.current == null && /已收集所有\\s*\\d+\\s*个印章/.test(t)) {
+                    const dm = t.match(/已收集所有\\s*(\\d+)\\s*个印章/);
+                    if (dm) {
+                      stamps.current = Number(dm[1]);
+                      if (!stamps.total) stamps.total = stamps.current;
+                    }
                   }
                 }
               }
@@ -913,7 +946,7 @@ async def scrape_earn_page_progress(page, *, force: bool = False) -> dict:
                 return null;
               };
 
-              if (stampCard) {
+              if (stampCard && stamps.current == null) {
                 const bar = stampCard.querySelector('[role="progressbar"]');
                 if (bar) {
                   const now = Number(bar.getAttribute('aria-valuenow'));
@@ -944,6 +977,7 @@ async def scrape_earn_page_progress(page, *, force: bool = False) -> dict:
               }
 
               // 核心：只数印章卡里「黑色实心圆」（已得），灰框空槽不计入
+              // 集齐后网格会变空白，此时不应把 current 留空
               if (stamps.current == null && stampCard) {
                 const expect = stamps.total || 12;
                 const seenPos = new Set();
@@ -990,6 +1024,9 @@ async def scrape_earn_page_progress(page, *, force: bool = False) -> dict:
                   const grid = r1.concat(r2);
                   const filled = grid.filter((d) => d.lum <= 95).length;
                   if (filled >= 1 && filled <= expect) stamps.current = filled;
+                } else if (darkDots.length === 0 && /已收集所有/.test(norm(stampCard.innerText || '')) && expect > 0) {
+                  // 集齐后圆点网格空白：用文案总数填满
+                  stamps.current = expect;
                 }
                 if (!stamps.total) stamps.total = expect;
               }

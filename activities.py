@@ -7,7 +7,7 @@ import random
 import re
 import time
 from typing import Awaitable, Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 from playwright.async_api import Page, BrowserContext
 
@@ -190,6 +190,43 @@ async def _dismiss_web_popups(page: Page) -> None:
             pass
 
 
+async def _clear_click_blockers(page: Page) -> None:
+    """清掉 Rewards 首页高 z-index 飞层，避免 body/遮罩吞掉卡片点击。"""
+    await _dismiss_web_popups(page)
+    try:
+        await page.keyboard.press("Escape")
+        await page.wait_for_timeout(200)
+    except Exception:
+        pass
+    try:
+        await page.evaluate(
+            """() => {
+              const killers = [];
+              for (const el of document.querySelectorAll('body *')) {
+                const s = getComputedStyle(el);
+                const z = parseInt(s.zIndex || '0', 10);
+                if (!(z >= 1000 && (s.position === 'fixed' || s.position === 'absolute'))) continue;
+                if (el.closest('#dailyset, [data-bi-id], main, header, nav')) continue;
+                const r = el.getBoundingClientRect();
+                if (r.width < 80 || r.height < 80) continue;
+                // 全屏/大半屏拦截层：隐藏指针
+                if (r.width * r.height > window.innerWidth * window.innerHeight * 0.35) {
+                  el.style.pointerEvents = 'none';
+                  killers.push(1);
+                }
+              }
+              return killers.length;
+            }"""
+        )
+    except Exception:
+        pass
+
+
+def _offer_is_tour(offer: dict) -> bool:
+    href = ((offer.get("href") or "") + " " + (offer.get("nearby") or "")).lower()
+    return ("filters=sid" in href) or ("form=tgrew" in href)
+
+
 def _looks_like_quiz(url: str, hint: str, body: str = "") -> bool:
     blob = f"{url} {hint} {body}".lower()
     return any(
@@ -256,76 +293,121 @@ async def _complete_activity_page(page: Page, *, offer_hint: str = "", open_only
         await page.wait_for_timeout(random.randint(1800, 3200))
         return "opened_puzzle"
 
-    is_quiz = _looks_like_quiz(url, hint, body_snip)
+    cur = (page.url or "").lower()
+    is_search_landing = "bing.com" in cur and ("/search?" in cur or ("q=" in cur and "/search" in cur))
+    is_quiz = _looks_like_quiz(url, hint, body_snip) and not (
+        # 探索/风光搜索卡：即使页面里有无关 radio，也不要当测验点掉
+        is_search_landing and not _looks_like_quiz(url, hint, "")
+    )
+
     # checkuser / 活动链跳转后测验控件可能晚出
-    if is_quiz or "rewards" in url or "checkuser" in url:
+    if is_quiz or ((("rewards" in url) or ("checkuser" in url)) and not is_search_landing):
         await _wait_quiz_ready(page, 8000)
         await _dismiss_web_popups(page)
 
-    # 投票/测验：多轮点选项/下一题
+    # 投票/测验：多轮点选项/下一题（搜索落地页跳过，避免误点）
     quiz_steps = 0
-    quiz_sels = (
-        "#rqStartQuiz",
-        "#rqAnswerOption0",
-        "#rqAnswerOption1",
-        "#rqAnswerOption2",
-        ".rqOption",
-        "#btoption0",
-        "#btoption1",
-        "#btoption2",
-        ".btOption",
-        '[id^="rqAnswerOption"]',
-        '[id^="btoption"]',
-        'input[type="radio"]',
-        '[role="radio"]',
-        "label:has(input[type=radio])",
-        "#rqNextQuestion",
-        "#nextQuestionbtn",
-        "button:has-text('提交')",
-        "button:has-text('下一题')",
-        "button:has-text('Next')",
-        "input[type=submit]",
-    )
-    for _ in range(12):
-        await _dismiss_web_popups(page)
-        clicked = False
-        for sel in quiz_sels:
-            try:
-                loc = page.locator(sel)
-                n = await loc.count()
-                if n <= 0:
+    if is_quiz:
+        quiz_sels = (
+            "#rqStartQuiz",
+            "#rqAnswerOption0",
+            "#rqAnswerOption1",
+            "#rqAnswerOption2",
+            ".rqOption",
+            "#btoption0",
+            "#btoption1",
+            "#btoption2",
+            ".btOption",
+            '[id^="rqAnswerOption"]',
+            '[id^="btoption"]',
+            'input[type="radio"]',
+            '[role="radio"]',
+            "label:has(input[type=radio])",
+            "#rqNextQuestion",
+            "#nextQuestionbtn",
+            "button:has-text('提交')",
+            "button:has-text('下一题')",
+            "button:has-text('Next')",
+            "input[type=submit]",
+        )
+        for _ in range(12):
+            await _dismiss_web_popups(page)
+            clicked = False
+            for sel in quiz_sels:
+                try:
+                    loc = page.locator(sel)
+                    n = await loc.count()
+                    if n <= 0:
+                        continue
+                    idx = 0 if n == 1 else random.randint(0, min(n, 4) - 1)
+                    target = loc.nth(idx)
+                    if not await target.is_visible():
+                        continue
+                    await target.click(timeout=2500, force=True)
+                    await page.wait_for_timeout(1100)
+                    quiz_steps += 1
+                    clicked = True
+                    break
+                except Exception:
                     continue
-                idx = 0 if n == 1 else random.randint(0, min(n, 4) - 1)
-                target = loc.nth(idx)
-                if not await target.is_visible():
+            if not clicked:
+                if quiz_steps == 0 and await _wait_quiz_ready(page, 2500):
                     continue
-                await target.click(timeout=2500, force=True)
-                await page.wait_for_timeout(1100)
-                quiz_steps += 1
-                clicked = True
                 break
+
+        if quiz_steps:
+            await page.wait_for_timeout(random.randint(1500, 2800))
+            return f"quiz_steps_{quiz_steps}"
+
+    # 已通过活动链落到带 q= 的搜索结果：停留/滚动；禁止改写搜索词
+    if is_search_landing:
+        # sid/tgrew 观光卡：点进结果可能丢掉归因，只停留滚动
+        tour_like = ("filters=sid" in cur) or ("form=tgrew" in cur) or ("form=tgrew" in hint.lower())
+        reported = False
+        if tour_like:
+            # 落地后立刻等 reportActivity；没有则多滚几轮再等
+            try:
+                await page.wait_for_request(
+                    lambda r: "reportactivity" in (r.url or "").lower(),
+                    timeout=8000,
+                )
+                reported = True
             except Exception:
-                continue
-        if not clicked:
-            # 再等一会控件，避免过早放弃
-            if quiz_steps == 0 and await _wait_quiz_ready(page, 2500):
-                continue
-            break
-
-    if quiz_steps:
-        await page.wait_for_timeout(random.randint(1500, 2800))
-        return f"quiz_steps_{quiz_steps}"
-
-    # 已通过活动链落到带 q= 的搜索结果：只停留/滚动，禁止改写搜索词（否则丢归因）
-    cur = (page.url or "").lower()
-    if "bing.com" in cur and ("/search?" in cur or "q=" in cur):
+                reported = False
         try:
-            await page.mouse.wheel(0, 800)
-            await page.wait_for_timeout(800)
-            await page.mouse.wheel(0, 600)
+            for _ in range(4 if tour_like else 2):
+                await page.mouse.wheel(0, random.randint(500, 1100))
+                await page.wait_for_timeout(random.randint(800, 1400))
         except Exception:
             pass
-        await page.wait_for_timeout(random.randint(2800, 4500))
+        if tour_like and not reported:
+            try:
+                await page.wait_for_request(
+                    lambda r: "reportactivity" in (r.url or "").lower(),
+                    timeout=10000,
+                )
+                reported = True
+            except Exception:
+                pass
+        if not tour_like:
+            # 普通 RewardsDO 搜索卡可点一条结果
+            try:
+                links = page.locator("#b_results h2 a, #b_results .b_algo h2 a")
+                n = await links.count()
+                if n > 0:
+                    idx = 0 if n == 1 else random.randint(0, min(n, 3) - 1)
+                    await _human_click_locator(page, links.nth(idx))
+                    await _wait_page_ready(page)
+                    await page.wait_for_timeout(random.randint(1500, 2800))
+                    return "search_landed_result"
+            except Exception:
+                pass
+        # 观光/sid 卡记账偏慢，多停留一会
+        await page.wait_for_timeout(
+            random.randint(12000 if tour_like else 2800, 18000 if tour_like else 4500)
+        )
+        if tour_like:
+            return "search_tour_dwell_ok" if reported else "search_tour_dwell"
         return "search_landed_dwell"
 
     # 仅当活动本身像“需要搜索”，且当前还不是结果页时，才主动搜
@@ -779,71 +861,406 @@ def _offer_key(offer: dict) -> str:
     return f"text:{near[:80]}"
 
 
-async def _open_offer_card(page: Page, context: BrowserContext, offer: dict) -> Page:
-    """点击任务卡片；优先按文案点（如完成此拼图），否则按 href。"""
+async def _wait_page_ready(page: Page, *, timeout_ms: int = 45000) -> None:
+    """等活动页尽量加载完整：DOMContentLoaded → load，再给 SPA/跳转一点缓冲。"""
+    try:
+        await page.wait_for_load_state(DOMCONTENTLOADED, timeout=timeout_ms)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_load_state("load", timeout=timeout_ms)
+    except Exception:
+        pass
+    # checkuser / 客户端跳转后再等一轮
+    await page.wait_for_timeout(1200)
+    try:
+        await page.wait_for_load_state(DOMCONTENTLOADED, timeout=15000)
+    except Exception:
+        pass
+    try:
+        await page.wait_for_load_state("load", timeout=15000)
+    except Exception:
+        pass
+    await page.wait_for_timeout(800)
+
+
+async def _human_pause(ms_min: int = 350, ms_max: int = 900) -> None:
+    await asyncio.sleep(random.uniform(ms_min, ms_max) / 1000.0)
+
+
+async def _human_click_locator(page: Page, locator) -> None:
+    """滚动可见 → 鼠标移入 → 短停 → 点击（单次，模拟真人）。"""
+    # 兼容 Locator / ElementHandle
+    target = locator.first if hasattr(locator, "first") else locator
+    try:
+        await target.scroll_into_view_if_needed(timeout=5000)
+    except Exception:
+        pass
+    await _human_pause(250, 700)
+    box = None
+    try:
+        box = await target.bounding_box()
+    except Exception:
+        box = None
+    if box and box.get("width", 0) > 2 and box.get("height", 0) > 2:
+        x = box["x"] + box["width"] * random.uniform(0.28, 0.72)
+        y = box["y"] + box["height"] * random.uniform(0.28, 0.72)
+        await page.mouse.move(x, y, steps=random.randint(10, 22))
+        await _human_pause(120, 380)
+        await page.mouse.down()
+        await _human_pause(40, 140)
+        await page.mouse.up()
+    else:
+        await target.click(timeout=5000, delay=random.randint(60, 160))
+    await _human_pause(200, 500)
+
+
+def _offer_search_query(href: str) -> str:
+    try:
+        q = parse_qs(urlparse(href).query).get("q", [""])[0]
+        return unquote(q or "").strip()
+    except Exception:
+        return ""
+
+
+def _href_unique_token(href: str) -> str:
+    """从活动链接提取尽量唯一的匹配片段（sid / CREA / 完整 q）。"""
+    try:
+        u = urlparse(href)
+        qs = parse_qs(u.query)
+        for key in ("filters", "sid", "CREA", "OCID", "FORM", "form"):
+            vals = qs.get(key) or []
+            if vals and len(str(vals[0])) >= 6:
+                return str(vals[0])[:80]
+        q = unquote((qs.get("q") or [""])[0] or "").strip()
+        if q:
+            return q
+    except Exception:
+        pass
+    return ""
+
+
+async def _resolve_offer_locator(page: Page, offer: dict):
+    """优先精确 href，避免点到同区其它已完成搜索卡。"""
     href = (offer.get("href") or "").strip()
     click_text = (offer.get("click_text") or "").strip()
-    nearby = (offer.get("nearby") or offer.get("text") or "").strip()
-    origin_url = page.url or ""
+    title = (offer.get("text") or "").strip()
+    nearby = (offer.get("nearby") or title).strip()
 
-    async def _click_target() -> None:
-        for needle in (click_text, "完成此拼图"):
-            if not needle:
-                continue
-            loc = page.locator(
-                f'a:has-text("{needle}"), button:has-text("{needle}"), [role="link"]:has-text("{needle}")'
+    if href:
+        matched = await page.evaluate(
+            """(href) => {
+              const links = [...document.querySelectorAll('a[href]')];
+              // 1) 完整 href
+              let hit = links.filter((a) => a.href === href);
+              if (hit.length === 1) return hit[0].href;
+              // 2) 查询串一致（忽略域名）
+              try {
+                const want = new URL(href);
+                hit = links.filter((a) => {
+                  try {
+                    const u = new URL(a.href);
+                    return u.search && u.search === want.search;
+                  } catch (e) { return false; }
+                });
+                if (hit.length === 1) return hit[0].href;
+                const q = decodeURIComponent(want.searchParams.get('q') || '');
+                if (q) {
+                  hit = links.filter((a) => {
+                    try {
+                      const u = new URL(a.href);
+                      return decodeURIComponent(u.searchParams.get('q') || '').includes(q);
+                    } catch (e) { return false; }
+                  });
+                  if (hit.length === 1) return hit[0].href;
+                }
+                const filters = want.searchParams.get('filters') || '';
+                if (filters.length >= 8) {
+                  hit = links.filter((a) => (a.href || '').includes(filters.slice(0, 40)));
+                  if (hit.length === 1) return hit[0].href;
+                }
+              } catch (e) {}
+              return '';
+            }""",
+            href,
+        )
+        if matched:
+            # 避免 CSS 特殊字符：用 JS 按绝对 href 找唯一节点再包成 locator
+            ok = await page.evaluate(
+                """(h) => {
+                  const el = [...document.querySelectorAll('a[href]')].find((a) => a.href === h);
+                  if (!el) return false;
+                  el.setAttribute('data-mra-offer', '1');
+                  return true;
+                }""",
+                matched,
             )
-            if await loc.count() > 0:
-                await loc.first.click(timeout=4000)
-                return
-            loc2 = page.get_by_text(needle, exact=False)
-            if await loc2.count() > 0:
-                await loc2.first.click(timeout=4000)
-                return
+            if ok:
+                loc = page.locator('a[data-mra-offer="1"]')
+                if await loc.count() > 0:
+                    return loc.first
+            # 退化为按 q 文本的 a:has-text 不稳，最后直接返回 None 让上层 goto href
+            return None
 
-        if href:
-            loc = page.locator(f'a[href="{href}"]')
-            if await loc.count() == 0:
-                path = urlparse(href).path or ""
-                if path and path != "/":
-                    loc = page.locator(f'a[href*="{path}"]')
-            if await loc.count() > 0:
-                await loc.first.click(timeout=4000)
-                return
-            await page.evaluate("(u) => window.open(u, '_blank')", href)
-            return
+    # 标题：要求出现在可点击 a 上，且尽量唯一
+    for needle in (title[:18], click_text, "完成此拼图"):
+        if not needle or len(needle) < 4:
+            continue
+        loc = page.locator(f'a:has-text("{needle}")')
+        n = await loc.count()
+        if n == 1:
+            return loc.first
+        if n > 1:
+            # 多个时结合 +分 父卡仍带 pending 的那个不好判，退回第一个含 needle 且 href 含 search 的
+            for i in range(n):
+                a = loc.nth(i)
+                try:
+                    h = (await a.get_attribute("href")) or ""
+                except Exception:
+                    h = ""
+                if href and _offer_search_query(href) and _offer_search_query(href) in unquote(h):
+                    return a
+            return loc.first
 
-        first_line = (nearby.split("+")[0] or nearby)[:30].strip()
-        if first_line:
-            loc = page.get_by_text(first_line, exact=False)
-            if await loc.count() > 0:
-                await loc.first.click(timeout=4000)
-                return
-        raise RuntimeError("找不到可点击的任务卡片")
+    first_line = (nearby.split("+")[0] or nearby)[:16].strip()
+    if first_line and len(first_line) >= 4:
+        loc = page.locator(f'a:has-text("{first_line}")')
+        if await loc.count() == 1:
+            return loc.first
+    return None
 
+
+async def _ensure_correct_landing(page: Page, offer: dict, *, log: Optional[LogFn] = None) -> None:
+    """若点错到其它搜索卡，强制导航到本活动 href。"""
+    href = (offer.get("href") or "").strip()
+    if not href:
+        return
+    expected_q = _offer_search_query(href)
+    if not expected_q:
+        return
+    cur = page.url or ""
+    cur_q = _offer_search_query(cur)
+    # 也看搜索框
     try:
-        async with context.expect_page(timeout=5000) as new_page_info:
-            await _click_target()
-        return await new_page_info.value
+        box = page.locator("#sb_form_q, input[name='q']")
+        if await box.count() > 0:
+            val = (await box.first.input_value()) or ""
+            if expected_q in val or expected_q in unquote(val):
+                return
     except Exception:
-        if href:
+        pass
+    if expected_q in unquote(cur) or (cur_q and (expected_q in cur_q or cur_q in expected_q)):
+        return
+    _log(log, f"落地页不匹配（期望「{expected_q}」，实际「{cur_q or cur[:60]}」），改开正确链接")
+    await page.goto(href, wait_until="load", timeout=45000)
+    await _wait_page_ready(page)
+
+
+async def _js_click_offer_anchor(page: Page, href: str) -> bool:
+    """直接触发卡片 <a>.click()，绕过 body 遮罩，保留 target=_blank 与 Rewards 归因。"""
+    if not href:
+        return False
+    try:
+        return bool(
+            await page.evaluate(
+                """(h) => {
+                  const links = [...document.querySelectorAll('a[href]')];
+                  let el = links.find((a) => a.href === h);
+                  if (!el) {
+                    try {
+                      const want = new URL(h);
+                      const q = decodeURIComponent(want.searchParams.get('q') || '');
+                      const filters = want.searchParams.get('filters') || '';
+                      if (q) {
+                        el = links.find((a) => {
+                          try {
+                            return decodeURIComponent(new URL(a.href).searchParams.get('q') || '').includes(q);
+                          } catch (e) { return false; }
+                        });
+                      }
+                      if (!el && filters.length >= 8) {
+                        el = links.find((a) => (a.href || '').includes(filters.slice(0, 40)));
+                      }
+                    } catch (e) {}
+                  }
+                  if (!el) {
+                    el = document.querySelector('a[data-mra-offer="1"]');
+                  }
+                  if (!el) return false;
+                  el.scrollIntoView({ block: 'center', inline: 'nearest' });
+                  el.click();
+                  return true;
+                }""",
+                href,
+            )
+        )
+    except Exception:
+        return False
+
+
+async def _open_offer_card(
+    page: Page,
+    context: BrowserContext,
+    offer: dict,
+    *,
+    log: Optional[LogFn] = None,
+) -> Page:
+    """拟人点击单张任务卡片；同一时刻只开这一张。
+
+    首页常有高 z-index 飞层导致 mouse 点到 body；观光卡必须点真实 <a>
+    才会带上 referrer 并在 Bing 侧触发 reportActivity。禁止优先 page.goto。
+    """
+    href = (offer.get("href") or "").strip()
+    tour = _offer_is_tour(offer)
+
+    page = await _close_extra_pages(context, page)
+    before_pages = list(context.pages)
+    await _clear_click_blockers(page)
+
+    loc = await _resolve_offer_locator(page, offer)
+    new_page = None
+    report_hits: list[str] = []
+
+    def _on_req(req) -> None:
+        u = (req.url or "").lower()
+        if "reportactivity" in u:
+            report_hits.append(req.url)
+
+    context.on("request", _on_req)
+    try:
+        async def _opened() -> bool:
+            if any(p not in before_pages and not p.is_closed() for p in context.pages):
+                return True
+            cur = page.url or ""
+            if href and "rewards.bing.com" not in cur and ("bing.com/search" in cur or "bing.com/" in cur):
+                return True
+            expected_q = _offer_search_query(href)
+            if expected_q and expected_q in unquote(cur):
+                return True
+            return False
+
+        async def _try_human() -> None:
+            if loc is None:
+                return
             try:
-                # 仍停在原任务列表页时，直接打开外链
-                cur = page.url or ""
-                if cur == origin_url or "rewards.bing.com" in cur:
-                    await page.goto(href, wait_until=DOMCONTENTLOADED, timeout=45000)
+                await _human_click_locator(page, loc)
             except Exception:
                 pass
-        return page
+
+        async def _try_force_locator() -> None:
+            if loc is None:
+                return
+            try:
+                await loc.click(timeout=4000, force=True, delay=random.randint(40, 120))
+            except Exception:
+                pass
+
+        async def _try_js_anchor() -> None:
+            await _js_click_offer_anchor(page, href)
+
+        # 顺序：拟人 → 校验；失败再 force → JS <a>.click（观光卡关键）
+        attempts = (_try_human, _try_force_locator, _try_js_anchor)
+        if tour:
+            # 观光卡优先 DOM click，避免遮罩吞鼠标后又 goto 丢归因
+            attempts = (_try_js_anchor, _try_force_locator, _try_human)
+
+        for attempt in attempts:
+            before_pages = list(context.pages)
+            try:
+                async with context.expect_page(timeout=8000) as new_page_info:
+                    await attempt()
+                new_page = await new_page_info.value
+                break
+            except Exception:
+                await page.wait_for_timeout(600)
+                if await _opened():
+                    break
+                continue
+
+        if new_page is None and not await _opened() and href:
+            # 最后手段：带 Referer 打开，尽量贴近从 Rewards 点出
+            try:
+                await _human_pause(300, 600)
+                await page.goto(
+                    href,
+                    wait_until="load",
+                    timeout=45000,
+                    referer="https://rewards.bing.com/",
+                )
+            except TypeError:
+                # 旧版 Playwright 无 referer 参数
+                try:
+                    await page.goto(href, wait_until="load", timeout=45000)
+                except Exception:
+                    pass
+            except Exception:
+                try:
+                    await page.evaluate(
+                        """(u) => {
+                          const a = document.createElement('a');
+                          a.href = u; a.target = '_blank'; a.rel = 'noopener noreferrer';
+                          document.body.appendChild(a); a.click(); a.remove();
+                        }""",
+                        href,
+                    )
+                    await page.wait_for_timeout(1500)
+                except Exception:
+                    pass
+
+        pages_now = [p for p in context.pages if not p.is_closed()]
+        if new_page is None:
+            newcomers = [p for p in pages_now if p not in before_pages]
+            if newcomers:
+                new_page = newcomers[-1]
+            else:
+                new_page = page
+
+        for p in pages_now:
+            if p == page or p == new_page:
+                continue
+            try:
+                await p.close()
+            except Exception:
+                pass
+
+        await _wait_page_ready(new_page)
+        # 观光卡：若被 _ensure 纠偏成 goto，可能丢掉 rdrig；仅在 q 明显错时纠正
+        if tour:
+            expected_q = _offer_search_query(href)
+            cur_q = _offer_search_query(new_page.url or "")
+            if expected_q and expected_q not in unquote(new_page.url or "") and expected_q not in (cur_q or ""):
+                await _ensure_correct_landing(new_page, offer, log=log)
+        else:
+            await _ensure_correct_landing(new_page, offer, log=log)
+
+        if tour and not report_hits:
+            try:
+                await new_page.wait_for_request(
+                    lambda r: "reportactivity" in (r.url or "").lower(),
+                    timeout=10000,
+                )
+                report_hits.append("late")
+            except Exception:
+                pass
+            if report_hits:
+                _log(log, "观光卡已收到 reportActivity")
+            else:
+                _log(log, "观光卡暂未捕获 reportActivity，继续停留等待记账")
+        return new_page
+    finally:
+        try:
+            context.remove_listener("request", _on_req)
+        except Exception:
+            pass
 
 
 async def _reload_offer_list(page: Page, list_url: str) -> Page:
     try:
         if list_url.rstrip("/") not in (page.url or ""):
-            await page.goto(list_url, wait_until=DOMCONTENTLOADED, timeout=60000)
+            await page.goto(list_url, wait_until="load", timeout=60000)
         else:
-            await page.reload(wait_until=DOMCONTENTLOADED, timeout=60000)
-        await page.wait_for_timeout(1500)
+            await page.reload(wait_until="load", timeout=60000)
+        await page.wait_for_timeout(random.randint(1600, 2600))
     except Exception:
         pass
     return page
@@ -858,21 +1275,20 @@ async def _execute_one_offer(
     label: str,
     log: Optional[LogFn] = None,
 ) -> Page:
-    """打开并操作单个活动，然后回到列表页。"""
+    """只操作一张卡：拟人点击 → 等加载 → 完成动作 → 关页 → 刷新列表。"""
     href = (offer.get("href") or "").strip()
     title = (offer.get("text") or "")[:60]
     hint = f"{offer.get('text', '')} {offer.get('nearby', '')}"
     is_puzzle = bool(offer.get("is_puzzle"))
-    kind = "拼图(仅打开)" if is_puzzle else label
 
     page = await _close_extra_pages(context, page)
     list_page = page
+    await _human_pause(400, 1100)
 
-    activity_page = await _open_offer_card(page, context, offer)
-    try:
-        await activity_page.wait_for_load_state(DOMCONTENTLOADED, timeout=30000)
-    except Exception:
-        pass
+    activity_page = await _open_offer_card(page, context, offer, log=log)
+    await _wait_page_ready(activity_page)
+    if not _offer_is_tour(offer):
+        await _ensure_correct_landing(activity_page, offer, log=log)
 
     try:
         if (
@@ -881,7 +1297,30 @@ async def _execute_one_offer(
             and "rewards.bing.com" in (activity_page.url or "")
             and href.lower() not in (activity_page.url or "").lower()
         ):
-            await activity_page.goto(href, wait_until=DOMCONTENTLOADED, timeout=45000)
+            await _human_pause(300, 700)
+            # 仍停在仪表盘：再点一次真实锚点（goto 易丢观光卡归因）
+            before = list(context.pages)
+            try:
+                async with context.expect_page(timeout=8000) as ni:
+                    await _js_click_offer_anchor(list_page, href)
+                activity_page = await ni.value
+            except Exception:
+                newcomers = [p for p in context.pages if p not in before and not p.is_closed()]
+                if newcomers:
+                    activity_page = newcomers[-1]
+                elif activity_page == list_page and "rewards.bing.com" in (activity_page.url or ""):
+                    try:
+                        await activity_page.goto(
+                            href,
+                            wait_until="load",
+                            timeout=45000,
+                            referer="https://rewards.bing.com/",
+                        )
+                    except TypeError:
+                        await activity_page.goto(href, wait_until="load", timeout=45000)
+            await _wait_page_ready(activity_page)
+            if not _offer_is_tour(offer):
+                await _ensure_correct_landing(activity_page, offer, log=log)
     except Exception:
         pass
 
@@ -892,6 +1331,7 @@ async def _execute_one_offer(
             open_only=is_puzzle,
         )
         _log(log, f"{label}已操作 ({how}): {title}")
+        await activity_page.wait_for_timeout(random.randint(1800, 3200))
     except Exception as e:
         _log(log, f"{label}异常: {e}")
 
@@ -902,9 +1342,11 @@ async def _execute_one_offer(
         pass
 
     page = await _latest_page(context, list_page if not list_page.is_closed() else page)
+    page = await _close_extra_pages(context, page)
+    await _human_pause(500, 1200)
     page = await _reload_offer_list(page, list_url)
-    # 积分状态有时延迟刷新，稍等再复核
-    await _sleep(1800, 2800)
+    # 刷新后再等一会，再交给外层做完成检测
+    await _sleep(1600, 2800)
     return page
 
 
@@ -1004,35 +1446,30 @@ async def _run_point_offers(
     max_offers: int = 16,
     max_retries_per_offer: int = 3,
 ) -> tuple[Page, int]:
-    """收集并完成带积分任务。
-
-    完成检测：刷新后抓同一卡片，优先识别「已完成/completed/已领取」；
-    若仍带 +分 则立刻重做该活动。首页每日活动与赚取页日常任务共用。
-    """
+    """逐张拟人操作活动卡：点一张 → 完成 → 刷新检测；未完成则重复该卡。"""
     if _stopped(should_stop):
         return page, 0
 
-    _log(log, f"开始{label}...")
+    _log(log, f"开始{label}（逐张拟人操作）...")
     try:
-        await page.goto(list_url, wait_until=DOMCONTENTLOADED, timeout=60000)
-        await page.wait_for_timeout(2500)
+        await page.goto(list_url, wait_until="load", timeout=60000)
+        await page.wait_for_timeout(random.randint(2000, 3200))
     except Exception as e:
         _log(log, f"打开{label}页面失败: {e}")
         return page, 0
 
     verified = 0
     hard_fail: set[str] = set()
-    seen_keys: set[str] = set()
+    empty_rounds = 0
 
-    for round_idx in range(1, 5):
-        if _stopped(should_stop) or verified >= max_offers:
-            break
-
+    while verified < max_offers and not _stopped(should_stop):
+        page = await _close_extra_pages(context, page)
         offers = await collect_fn(page)
         pending = [o for o in offers if _offer_key(o) not in hard_fail]
-        _log(log, f"{label} 第 {round_idx} 轮发现 {len(pending)} 个（候选 {len(offers)}）")
+        _log(log, f"{label} 待做 {len(pending)} 个（候选 {len(offers)}）")
         if not pending:
-            if round_idx == 1:
+            empty_rounds += 1
+            if empty_rounds == 1 and verified == 0:
                 try:
                     tip = await page.evaluate(
                         """() => {
@@ -1059,77 +1496,124 @@ async def _run_point_offers(
                     pass
             break
 
-        progressed = False
-        for offer in pending:
-            if _stopped(should_stop) or verified >= max_offers:
+        empty_rounds = 0
+        # 严格一次只取一张，做完并复核后再扫下一张
+        offer = pending[0]
+        key = _offer_key(offer)
+        title = (offer.get("text") or "")[:60]
+        current = offer
+        ok = False
+
+        for attempt in range(1, max_retries_per_offer + 1):
+            if _stopped(should_stop):
+                break
+            _log(
+                log,
+                f"处理{label}: {title}"
+                + (f"（第 {attempt}/{max_retries_per_offer} 次）" if attempt > 1 else ""),
+            )
+            try:
+                page = await _execute_one_offer(
+                    page,
+                    context,
+                    current,
+                    list_url=list_url,
+                    label=label,
+                    log=log,
+                )
+            except Exception as e:
+                _log(log, f"打开/执行{label}失败: {e}")
+                page = await _close_extra_pages(context, page)
+                page = await _reload_offer_list(page, list_url)
+                refreshed = await collect_fn(page)
+                current = next((o for o in refreshed if _offer_key(o) == key), current)
+                await _human_pause(700, 1400)
+                continue
+
+            # 完成检测前再显式刷新一次，避免旧 DOM
+            page = await _reload_offer_list(page, list_url)
+            await _human_pause(800, 1500)
+            status = await _check_offer_completion(page, current)
+            still = await _offer_still_pending(collect_fn, page, current)
+            if status.get("done") and not still:
+                verified += 1
+                ok = True
+                _log(log, f"{label}复核通过（{status.get('reason')}）: {title}")
                 break
 
+            if status.get("done") and still:
+                _log(log, f"{label}状态冲突（{status.get('reason')}，收集器仍见+分）: {title}")
+            else:
+                _log(log, f"{label}复核未通过（{status.get('reason')}）: {title}")
+
+            refreshed = await collect_fn(page)
+            found = next((o for o in refreshed if _offer_key(o) == key), None)
+            if found is None:
+                verified += 1
+                ok = True
+                _log(log, f"{label}复核通过（刷新后卡片消失）: {title}")
+                break
+            current = found
+            if attempt < max_retries_per_offer:
+                _log(log, f"{label}未完成，重复操作: {title}")
+                await _human_pause(900, 1800)
+
+        if not ok:
+            hard_fail.add(key)
+            _log(log, f"{label}复核失败已达 {max_retries_per_offer} 次，跳过: {title}")
+
+        page = await _close_extra_pages(context, page)
+        # 下一张卡前稍停，避免连点
+        await _human_pause(800, 1600)
+
+    # 对先前失败的卡再整轮重试一次（避免点错/归因延迟导致误杀）
+    if hard_fail and not _stopped(should_stop):
+        retry_keys = set(hard_fail)
+        hard_fail.clear()
+        _log(log, f"{label} 对失败卡片再试一轮（{len(retry_keys)} 个）")
+        page = await _reload_offer_list(page, list_url)
+        await _human_pause(1000, 1800)
+        offers = await collect_fn(page)
+        for offer in offers:
+            if _stopped(should_stop) or verified >= max_offers:
+                break
             key = _offer_key(offer)
+            if key not in retry_keys:
+                continue
             title = (offer.get("text") or "")[:60]
             current = offer
             ok = False
-
             for attempt in range(1, max_retries_per_offer + 1):
-                if _stopped(should_stop):
-                    break
-                _log(
-                    log,
-                    f"处理{label}: {title}"
-                    + (f"（第 {attempt}/{max_retries_per_offer} 次）" if attempt > 1 else ""),
-                )
+                _log(log, f"重试{label}: {title}（第 {attempt}/{max_retries_per_offer} 次）")
                 try:
                     page = await _execute_one_offer(
-                        page,
-                        context,
-                        current,
-                        list_url=list_url,
-                        label=label,
-                        log=log,
+                        page, context, current, list_url=list_url, label=label, log=log
                     )
                 except Exception as e:
-                    _log(log, f"打开/执行{label}失败: {e}")
+                    _log(log, f"重试打开失败: {e}")
                     page = await _reload_offer_list(page, list_url)
-                    # 刷新后用最新卡片再试
-                    refreshed = await collect_fn(page)
-                    current = next((o for o in refreshed if _offer_key(o) == key), current)
                     continue
-
-                # 完成检测：优先看卡片「已完成/completed」，否则看是否还带 +分
+                page = await _reload_offer_list(page, list_url)
                 status = await _check_offer_completion(page, current)
                 still = await _offer_still_pending(collect_fn, page, current)
                 if status.get("done") and not still:
                     verified += 1
-                    progressed = True
                     ok = True
-                    _log(log, f"{label}复核通过（{status.get('reason')}）: {title}")
+                    _log(log, f"{label}重试复核通过（{status.get('reason')}）: {title}")
                     break
-                if status.get("done") and still:
-                    # 状态文案像完成，但收集器仍扫到 +分 → 以 +分为准重做
-                    _log(log, f"{label}状态冲突（{status.get('reason')}，收集器仍见+分）: {title}")
-                else:
-                    _log(log, f"{label}复核未通过（{status.get('reason')}）: {title}")
-
-                refreshed = await collect_fn(page)
-                current = next((o for o in refreshed if _offer_key(o) == key), current)
-                if attempt < max_retries_per_offer:
-                    _log(log, f"{label}立即重做: {title}")
-                    await _sleep(600, 1200)
-
+                found = next((o for o in await collect_fn(page) if _offer_key(o) == key), None)
+                if found is None:
+                    verified += 1
+                    ok = True
+                    _log(log, f"{label}重试复核通过（卡片消失）: {title}")
+                    break
+                current = found
+                await _human_pause(900, 1600)
             if not ok:
                 hard_fail.add(key)
-                _log(log, f"{label}复核失败已达 {max_retries_per_offer} 次，跳过: {title}")
-            seen_keys.add(key)
+                _log(log, f"{label}重试仍未完成，跳过: {title}")
             page = await _close_extra_pages(context, page)
-
-        if not progressed:
-            left = [o for o in await collect_fn(page) if _offer_key(o) not in hard_fail]
-            if not left:
-                break
-            # 本轮全是已见过且仍失败的，结束避免空转
-            if all(_offer_key(o) in seen_keys for o in left) and round_idx >= 2:
-                titles = ", ".join((o.get("text") or "")[:24] for o in left[:5])
-                _log(log, f"{label}仍有 {len(left)} 个未通过: {titles}")
-                break
+            await _human_pause(700, 1400)
 
     page = await _reload_offer_list(page, list_url)
     all_left = await collect_fn(page)
