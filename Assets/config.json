@@ -1,5 +1,6 @@
 {
   "headless": true,
   "daily_activities": true,
-  "auto_claim": true
+  "auto_claim": true,
+  "adb_bing_app": true
 }

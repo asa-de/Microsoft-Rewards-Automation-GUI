@@ -36,7 +36,7 @@ from main import (
     read_account_meta,
 )
 from activities import claim_available_rewards, complete_daily_activities
-from adb_bing import complete_bing_app_checkin
+from adb_bing import complete_bing_app_checkin, list_devices, resolve_adb_path
 
 # Playwright 异步 API（用于浏览器自动化）
 from playwright.async_api import async_playwright
@@ -295,8 +295,13 @@ class RewardsGUI(QtWidgets.QMainWindow):
         self.dashboard_timer.setInterval(100)
         self.dashboard_timer.timeout.connect(self._show_dashboard_for_selected)
         self.dashboard_timer.start()
+        self.adb_timer = QtCore.QTimer(self)
+        self.adb_timer.setInterval(3000)
+        self.adb_timer.timeout.connect(self._refresh_adb_device_status)
+        self.adb_timer.start()
         self.load_config()
         self.refresh_accounts()
+        self._refresh_adb_device_status()
 
     # region UI 构建
     def _build_ui(self):
@@ -322,10 +327,14 @@ class RewardsGUI(QtWidgets.QMainWindow):
         self.cb_adb_app.setToolTip(
             "真机必应：切换到当前账号（需已在 App 预登录）并点击「签入」；需开启 USB 调试（安全设置）"
         )
+        self.lbl_adb_device = QtWidgets.QLabel("手机: 检测中…")
+        self.lbl_adb_device.setToolTip("ADB 设备连接状态（约每 3 秒刷新）")
+        self.lbl_adb_device.setMinimumWidth(180)
         opts.addWidget(self.cb_headless)
         opts.addWidget(self.cb_daily)
         opts.addWidget(self.cb_claim)
         opts.addWidget(self.cb_adb_app)
+        opts.addWidget(self.lbl_adb_device)
         opts.addStretch(1)
 
         # 按钮区
@@ -1096,6 +1105,17 @@ class RewardsGUI(QtWidgets.QMainWindow):
     # endregion
 
     # region 任务控制
+    def _warn_if_adb_disconnected(self) -> None:
+        if not self.enable_adb_bing_app:
+            return
+        self._refresh_adb_device_status()
+        text = self.lbl_adb_device.text() if hasattr(self, "lbl_adb_device") else ""
+        if "已连接" not in text:
+            self.log_signal.emit(
+                f"已开启应用签到(ADB)，但当前{text or '手机未就绪'}；任务仍会跑网页部分，签到可能失败",
+                "WARN",
+            )
+
     def start_task(self):
         item = self.accounts_list.currentItem()
         if not item:
@@ -1109,6 +1129,8 @@ class RewardsGUI(QtWidgets.QMainWindow):
         if task_name in self.running_tasks:
             self.log_signal.emit(f"账号 {cookie_path.stem} 已在运行中", "WARN")
             return
+
+        self._warn_if_adb_disconnected()
         
         self.selected_cookie = cookie_path
         # 重置该账号的停止标记，避免上一次停止后遗留的 True 影响本次启动
@@ -1126,6 +1148,7 @@ class RewardsGUI(QtWidgets.QMainWindow):
         if not files:
             self.log_signal.emit("未找到任何账号 cookies", "WARN")
             return
+        self._warn_if_adb_disconnected()
         device_type = "windows"
         self.is_running = True
         self.task_stop_flags.pop("__global", None)
@@ -1498,6 +1521,57 @@ class RewardsGUI(QtWidgets.QMainWindow):
         self.enable_auto_claim = self.cb_claim.isChecked()
         self.enable_adb_bing_app = self.cb_adb_app.isChecked()
         self.save_config()
+        self._refresh_adb_device_status()
+
+    def _refresh_adb_device_status(self) -> None:
+        """顶部显示 ADB 手机连接状态。"""
+        if not hasattr(self, "lbl_adb_device"):
+            return
+        if not self.cb_adb_app.isChecked():
+            self.lbl_adb_device.setText("手机: 已关闭")
+            self.lbl_adb_device.setStyleSheet("color: #888;")
+            return
+        try:
+            adb = resolve_adb_path()
+            if not adb:
+                self.lbl_adb_device.setText("手机: 无 adb")
+                self.lbl_adb_device.setStyleSheet("color: #c0392b;")
+                self.lbl_adb_device.setToolTip("未找到 adb（请保留 Assets/platform-tools）")
+                return
+            devices = list_devices(adb)
+            ready = [d for d in devices if d.get("state") == "device"]
+            unauthorized = [d for d in devices if d.get("state") == "unauthorized"]
+            offline = [d for d in devices if d.get("state") not in ("device", "unauthorized")]
+            if ready:
+                d0 = ready[0]
+                model = d0.get("model") or d0.get("device") or ""
+                serial = d0.get("serial") or ""
+                label = model or serial
+                extra = f" 等{len(ready)}台" if len(ready) > 1 else ""
+                self.lbl_adb_device.setText(f"手机: 已连接 {label}{extra}")
+                self.lbl_adb_device.setStyleSheet("color: #27ae60;")
+                tip = "\n".join(
+                    f"{d.get('serial')} ({d.get('model') or d.get('state')})" for d in ready
+                )
+                self.lbl_adb_device.setToolTip(tip or serial)
+            elif unauthorized:
+                self.lbl_adb_device.setText("手机: 待授权")
+                self.lbl_adb_device.setStyleSheet("color: #d35400;")
+                self.lbl_adb_device.setToolTip("请在手机上允许 USB 调试授权")
+            elif offline:
+                self.lbl_adb_device.setText("手机: 离线/未就绪")
+                self.lbl_adb_device.setStyleSheet("color: #d35400;")
+                self.lbl_adb_device.setToolTip(
+                    "\n".join(f"{d.get('serial')}: {d.get('state')}" for d in offline)
+                )
+            else:
+                self.lbl_adb_device.setText("手机: 未连接")
+                self.lbl_adb_device.setStyleSheet("color: #c0392b;")
+                self.lbl_adb_device.setToolTip("请用 USB 连接手机并开启 USB 调试")
+        except Exception as e:
+            self.lbl_adb_device.setText("手机: 检测失败")
+            self.lbl_adb_device.setStyleSheet("color: #c0392b;")
+            self.lbl_adb_device.setToolTip(str(e)[:200])
 
     # Qt 生命周期
     def closeEvent(self, event: QtGui.QCloseEvent):  # noqa: N802

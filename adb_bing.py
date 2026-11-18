@@ -257,6 +257,79 @@ def _wake_screen(adb: Path, serial: str) -> None:
         time.sleep(0.4)
 
 
+def _dismiss_ui_popups(adb: Path, serial: str) -> bool:
+    """关闭必应/积分页常见弹窗（知道了/关闭/稍后等）。返回是否点过。"""
+    dismiss_texts = (
+        "知道了",
+        "我知道了",
+        "Got it",
+        "关闭",
+        "Close",
+        "Dismiss",
+        "稍后",
+        "以后再说",
+        "下次再说",
+        "跳过",
+        "Not now",
+        "确定",
+        "OK",
+        "好的",
+        "暂不",
+        "允许",
+    )
+    clicked = False
+    try:
+        root = _dump_ui(adb, serial)
+    except Exception:
+        return False
+    text_blob = _ui_text(root)
+    # 无弹窗特征时跳过，避免误点主界面
+    if not any(t in text_blob for t in dismiss_texts):
+        return False
+    for needle in dismiss_texts:
+        # 优先点按钮类节点，避开大段文案
+        hit = None
+        for n in _iter_nodes(root):
+            t = (n.attrib.get("text") or "").strip()
+            d = (n.attrib.get("content-desc") or "").strip()
+            cls = (n.attrib.get("class") or "")
+            if t != needle and d != needle:
+                continue
+            if n.attrib.get("clickable") != "true" and "Button" not in cls and "TextView" not in cls:
+                continue
+            c = _bounds_center(n.attrib.get("bounds") or "")
+            if not c:
+                continue
+            # 避开过宽的整行容器
+            m = BOUNDS_RE.match(n.attrib.get("bounds") or "")
+            if m:
+                x1, y1, x2, y2 = map(int, m.groups())
+                if (x2 - x1) > 900 and (y2 - y1) > 200:
+                    continue
+            hit = (c[0], c[1], needle)
+            break
+        if hit:
+            _tap(adb, serial, hit[0], hit[1])
+            time.sleep(1.0)
+            clicked = True
+            break
+    # 关闭图标（X）
+    if not clicked:
+        for n in _iter_nodes(root):
+            rid = (n.attrib.get("resource-id") or "").lower()
+            d = (n.attrib.get("content-desc") or "").strip().lower()
+            if any(k in rid or k in d for k in ("close", "dismiss", "cancel", "关闭")):
+                if n.attrib.get("clickable") != "true":
+                    continue
+                c = _bounds_center(n.attrib.get("bounds") or "")
+                if c:
+                    _tap(adb, serial, c[0], c[1])
+                    time.sleep(1.0)
+                    clicked = True
+                    break
+    return clicked
+
+
 def _dismiss_blockers(adb: Path, serial: str) -> None:
     _wake_screen(adb, serial)
     for pkg in (
@@ -609,6 +682,14 @@ async def _do_checkin(adb: Path, serial: str, *, log: Optional[LogFn] = None) ->
         if log:
             log(msg)
 
+    # 启动后可能弹出引导/通知授权等
+    for _ in range(3):
+        if _dismiss_ui_popups(adb, serial):
+            _log("ADB 已关闭弹窗")
+            await asyncio.sleep(0.6)
+        else:
+            break
+
     root = _open_profile(adb, serial)
     if _is_account_picker(root) or _is_settings_page(root):
         raise RuntimeError("签到前未进入个人页（仍在帐户/设置页）")
@@ -619,21 +700,50 @@ async def _do_checkin(adb: Path, serial: str, *, log: Optional[LogFn] = None) ->
         or _find_click_point(root, "总积分", "积分")
     )
     if not rewards:
+        # 个人页也可能被弹窗挡住
+        if _dismiss_ui_popups(adb, serial):
+            _log("ADB 个人页关闭弹窗后重试")
+            root = _open_profile(adb, serial)
+            rewards = (
+                _find_click_point(root, "Microsoft Rewards")
+                or _find_click_point(root, "sa_profile_my_rewards_points", "每日积分")
+                or _find_click_point(root, "sa_profile_rewards_root")
+                or _find_click_point(root, "总积分", "积分")
+            )
+    if not rewards:
         raise RuntimeError("个人页未找到「积分 / Microsoft Rewards」入口")
     _log(f"进入积分页: {rewards[2]}")
     _tap(adb, serial, rewards[0], rewards[1])
     await asyncio.sleep(3.5)
 
+    for _ in range(3):
+        if _dismiss_ui_popups(adb, serial):
+            _log("ADB 积分页已关闭弹窗")
+            await asyncio.sleep(0.8)
+        else:
+            break
+
     root = _dump_ui(adb, serial)
     if "签入" not in _ui_text(root):
         await asyncio.sleep(2.5)
+        if _dismiss_ui_popups(adb, serial):
+            await asyncio.sleep(0.6)
         root = _dump_ui(adb, serial)
     target = _click_checkin_points(root) or _find_click_point(root, "签入", "签到")
+    if not target:
+        if _dismiss_ui_popups(adb, serial):
+            _log("ADB 关闭弹窗后重找签入")
+            await asyncio.sleep(0.8)
+            root = _dump_ui(adb, serial)
+            target = _click_checkin_points(root) or _find_click_point(root, "签入", "签到")
     if not target:
         raise RuntimeError("积分页未找到「签入」栏可点积分")
     _log(f"点击签入: {target[2]}")
     _tap(adb, serial, target[0], target[1])
     await asyncio.sleep(2.5)
+    # 签入后偶发确认弹窗
+    if _dismiss_ui_popups(adb, serial):
+        await asyncio.sleep(0.8)
     root2 = _dump_ui(adb, serial)
     return any(
         (n.attrib.get("content-desc") or "") == "checked" or "check_mark" in (n.attrib.get("text") or "")

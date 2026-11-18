@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import random
 import re
+import time
 from typing import Awaitable, Callable, Optional
 from urllib.parse import urlparse
 
@@ -168,12 +169,77 @@ async def _expand_homepage_dailyset(page: Page) -> None:
             pass
 
 
+async def _dismiss_web_popups(page: Page) -> None:
+    """关掉活动页常见遮罩/提示，避免挡住答题。"""
+    for text in ("知道了", "我知道了", "Got it", "关闭", "Close", "确定", "OK", "跳过", "稍后", "Not now"):
+        try:
+            loc = page.get_by_role("button", name=re.compile(re.escape(text), re.I))
+            if await loc.count() > 0 and await loc.first.is_visible():
+                await loc.first.click(timeout=1500)
+                await page.wait_for_timeout(400)
+                return
+        except Exception:
+            pass
+        try:
+            loc = page.get_by_text(text, exact=True)
+            if await loc.count() > 0 and await loc.first.is_visible():
+                await loc.first.click(timeout=1500)
+                await page.wait_for_timeout(400)
+                return
+        except Exception:
+            pass
+
+
+def _looks_like_quiz(url: str, hint: str, body: str = "") -> bool:
+    blob = f"{url} {hint} {body}".lower()
+    return any(
+        k in blob
+        for k in (
+            "quiz",
+            "rqanswer",
+            "rqstart",
+            "极速问答",
+            "测验",
+            "投票",
+            "trivia",
+            "poll",
+            "thisorthat",
+            "warpspeed",
+        )
+    )
+
+
+async def _wait_quiz_ready(page: Page, timeout_ms: int = 8000) -> bool:
+    selectors = (
+        "#rqStartQuiz",
+        "#rqAnswerOption0",
+        ".rqOption",
+        "#btoption0",
+        ".btOption",
+        "#rqOverlayOptions",
+        '[id^="rqAnswerOption"]',
+        '[id^="btoption"]',
+    )
+    deadline = time.monotonic() + timeout_ms / 1000.0
+    while time.monotonic() < deadline:
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                if await loc.count() > 0 and await loc.first.is_visible():
+                    return True
+            except Exception:
+                continue
+        await page.wait_for_timeout(400)
+    return False
+
+
 async def _complete_activity_page(page: Page, *, offer_hint: str = "", open_only: bool = False) -> str:
     """尝试完成当前活动页，返回处理方式说明。
 
-    日常任务里的拼图/打开类：只需打开页面，无需真正拼图。
+    注意：必应页顶栏永远有搜索框，不能一找不到测验就乱搜，否则会毁掉测验/探索积分归因。
     """
     await page.wait_for_timeout(900)
+    await _dismiss_web_popups(page)
     url = (page.url or "").lower()
     hint = offer_hint or ""
 
@@ -183,52 +249,272 @@ async def _complete_activity_page(page: Page, *, offer_hint: str = "", open_only
         return "opened_puzzle" if _is_puzzle_offer(url, hint) else "opened_only"
 
     try:
-        body_snip = ((await page.locator("body").inner_text(timeout=2000)) or "")[:800]
+        body_snip = ((await page.locator("body").inner_text(timeout=2000)) or "")[:1200]
     except Exception:
         body_snip = ""
     if _is_puzzle_offer(url, body_snip) or ("拼图" in body_snip and "排列图块" in body_snip):
         await page.wait_for_timeout(random.randint(1800, 3200))
         return "opened_puzzle"
 
-    # 投票/测验：点可选选项
-    for sel in (
+    is_quiz = _looks_like_quiz(url, hint, body_snip)
+    # checkuser / 活动链跳转后测验控件可能晚出
+    if is_quiz or "rewards" in url or "checkuser" in url:
+        await _wait_quiz_ready(page, 8000)
+        await _dismiss_web_popups(page)
+
+    # 投票/测验：多轮点选项/下一题
+    quiz_steps = 0
+    quiz_sels = (
+        "#rqStartQuiz",
+        "#rqAnswerOption0",
+        "#rqAnswerOption1",
+        "#rqAnswerOption2",
+        ".rqOption",
+        "#btoption0",
+        "#btoption1",
+        "#btoption2",
+        ".btOption",
+        '[id^="rqAnswerOption"]',
+        '[id^="btoption"]',
         'input[type="radio"]',
         '[role="radio"]',
         "label:has(input[type=radio])",
-        "#rqAnswerOption0",
-        ".rqOption",
-        "button:has-text('提交')",
-        "input[type=submit]",
-        "#rqStartQuiz",
         "#rqNextQuestion",
         "#nextQuestionbtn",
-    ):
-        try:
-            loc = page.locator(sel)
-            n = await loc.count()
-            if n <= 0:
+        "button:has-text('提交')",
+        "button:has-text('下一题')",
+        "button:has-text('Next')",
+        "input[type=submit]",
+    )
+    for _ in range(12):
+        await _dismiss_web_popups(page)
+        clicked = False
+        for sel in quiz_sels:
+            try:
+                loc = page.locator(sel)
+                n = await loc.count()
+                if n <= 0:
+                    continue
+                idx = 0 if n == 1 else random.randint(0, min(n, 4) - 1)
+                target = loc.nth(idx)
+                if not await target.is_visible():
+                    continue
+                await target.click(timeout=2500, force=True)
+                await page.wait_for_timeout(1100)
+                quiz_steps += 1
+                clicked = True
+                break
+            except Exception:
                 continue
-            idx = 0 if n == 1 else random.randint(0, min(n, 3) - 1)
-            await loc.nth(idx).click(timeout=2000)
+        if not clicked:
+            # 再等一会控件，避免过早放弃
+            if quiz_steps == 0 and await _wait_quiz_ready(page, 2500):
+                continue
+            break
+
+    if quiz_steps:
+        await page.wait_for_timeout(random.randint(1500, 2800))
+        return f"quiz_steps_{quiz_steps}"
+
+    # 已通过活动链落到带 q= 的搜索结果：只停留/滚动，禁止改写搜索词（否则丢归因）
+    cur = (page.url or "").lower()
+    if "bing.com" in cur and ("/search?" in cur or "q=" in cur):
+        try:
+            await page.mouse.wheel(0, 800)
             await page.wait_for_timeout(800)
+            await page.mouse.wheel(0, 600)
         except Exception:
-            continue
+            pass
+        await page.wait_for_timeout(random.randint(2800, 4500))
+        return "search_landed_dwell"
 
-    # 搜索框类活动
-    try:
-        box = page.locator("#sb_form_q, input[name='q'], textarea[name='q']")
-        if await box.count() > 0 and "bing.com" in url:
-            q = random.choice(["天气", "新闻", "微软积分", "今日热点", "地图"])
-            await box.first.fill("")
-            await box.first.type(q, delay=60)
-            await page.keyboard.press("Enter")
-            await page.wait_for_timeout(2000)
-            return "search_submitted"
-    except Exception:
-        pass
+    # 仅当活动本身像“需要搜索”，且当前还不是结果页时，才主动搜
+    need_search = any(k in f"{hint} {body_snip}".lower() for k in ("搜索", "search", "查找", "逛一逛"))
+    if need_search and not is_quiz:
+        try:
+            box = page.locator("#sb_form_q, input[name='q'], textarea[name='q']")
+            if await box.count() > 0 and "bing.com" in cur:
+                # 若框里已有活动带来的词，直接回车，不要换成随机词
+                existing = ""
+                try:
+                    existing = (await box.first.input_value()) or ""
+                except Exception:
+                    existing = ""
+                if existing.strip():
+                    await page.keyboard.press("Enter")
+                else:
+                    q = random.choice(["天气", "新闻", "微软积分", "今日热点", "地图"])
+                    await box.first.fill("")
+                    await box.first.type(q, delay=60)
+                    await page.keyboard.press("Enter")
+                await page.wait_for_timeout(2500)
+                return "search_submitted"
+        except Exception:
+            pass
 
-    await page.wait_for_timeout(random.randint(2200, 4000))
+    await page.wait_for_timeout(random.randint(2800, 4500))
     return "dwelt"
+
+
+_COLLECT_SECTION_JS = """({ titles, nextSectionPattern, rootSelector, includeCompleted }) => {
+  const norm = (s) => (s || '').trim().replace(/\\s+/g, ' ');
+  const yOf = (el) => {
+    try { return el.getBoundingClientRect().top + window.scrollY; }
+    catch (e) { return 0; }
+  };
+  const ptsRe = /[+＋]\\s*\\d+/;
+  const doneRe = /^(已完成|completed|已领取)$/i;
+  const titleSet = (titles || []).map((t) => norm(t)).filter(Boolean);
+
+  const readStatus = (card) => {
+    let plus = null;
+    let done = false;
+    for (const s of card.querySelectorAll('div,span,p,em,strong,label')) {
+      const st = norm(s.innerText || '');
+      if (!st || st.length > 18) continue;
+      if (doneRe.test(st)) { done = true; continue; }
+      if (/^[+＋]\\s*\\d+$/.test(st)) { plus = st; continue; }
+    }
+    // 兜底：整卡文案
+    const ct = norm(card.innerText || '');
+    if (!done && /(^|\\s)(已完成|completed|已领取)(\\s|$)/i.test(ct) && !ptsRe.test(ct)) done = true;
+    if (!plus) {
+      const m = ct.match(/[+＋]\\s*(\\d+)/);
+      if (m) plus = '+' + m[1];
+    }
+    return { plus, done };
+  };
+
+  const smallestCard = (start, root) => {
+    let card = start;
+    let best = start;
+    for (let i = 0; i < 8; i++) {
+      const p = card.parentElement;
+      if (!p || p === root || p === document.body) break;
+      const pt = norm(p.innerText || '');
+      if (pt.length > 260) break;
+      const plusCount = (pt.match(/[+＋]\\s*\\d+/g) || []).length;
+      const doneCount = (pt.match(/已完成|completed|已领取/gi) || []).length;
+      // 多卡集合：多个 +分 或多个「已完成」
+      if (plusCount + doneCount >= 3) break;
+      if (plusCount >= 2 && doneCount >= 1) break;
+      card = p;
+      const st = readStatus(card);
+      if (st.plus || st.done) best = card;
+      // 单卡且已有标题+状态即可停
+      if ((st.plus || st.done) && pt.length >= 8 && pt.length <= 220 && plusCount <= 1) {
+        best = card;
+        break;
+      }
+    }
+    return best;
+  };
+
+  let root = null;
+  let matchedTitle = '';
+  if (rootSelector) {
+    root = document.querySelector(rootSelector);
+    matchedTitle = titleSet[0] || rootSelector;
+  }
+  let heading = null;
+  if (!root) {
+    for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p')) {
+      const own = norm(el.innerText || '');
+      if (!own || own.length > 40) continue;
+      for (const t of titleSet) {
+        if (own === t || (own.startsWith(t) && own.length <= t.length + 12)) {
+          heading = el; matchedTitle = t; break;
+        }
+      }
+      if (heading) break;
+    }
+    if (!heading) return [];
+    // 标题附近找分区容器
+    root = heading.parentElement || heading;
+    for (let i = 0; i < 6; i++) {
+      const p = root.parentElement;
+      if (!p || p === document.body) break;
+      const pt = norm(p.innerText || '');
+      if (pt.length > 6000) break;
+      root = p;
+      // 够大且含多链接就停
+      if (p.querySelectorAll('a[href]').length >= 2 && pt.length > 80) break;
+    }
+  }
+
+  const headingY = heading ? yOf(heading) : yOf(root);
+  let nextSectionRe;
+  try { nextSectionRe = new RegExp(nextSectionPattern, 'i'); }
+  catch (e) { nextSectionRe = /^(更多活动|探索|游戏|必应搜索|邀请)/i; }
+  let nextY = Infinity;
+  for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6')) {
+    const own = norm(el.innerText || '');
+    if (!own || own.length > 40) continue;
+    if (titleSet.some((t) => own === t || own.startsWith(t))) continue;
+    if (!nextSectionRe.test(own)) continue;
+    const y = yOf(el);
+    if (y > headingY + 40 && y < nextY) nextY = y;
+  }
+  if (nextY === Infinity) nextY = headingY + 4000;
+
+  const items = [];
+  const seen = new Set();
+  const links = root.querySelectorAll('a[href], button, [role="link"]');
+  for (const a of links) {
+    const y = yOf(a);
+    if (!rootSelector && (y < headingY - 40 || y >= nextY)) continue;
+    const aText = norm(a.innerText || a.getAttribute('aria-label') || '');
+    if (aText.length > 200) continue;
+    const card = smallestCard(a, root);
+    const cardText = norm(card.innerText || '');
+    if (cardText.length < 4 || cardText.length > 260) continue;
+    const st = readStatus(card);
+    const plusCount = (cardText.match(/[+＋]\\s*\\d+/g) || []).length;
+    if (plusCount > 1) continue; // 仍是多卡
+    if (st.done && !includeCompleted) continue;
+    if (!st.done && !st.plus && !/\\d+\\s*积分/.test(cardText)) continue;
+    // 待做必须带 +分；完成卡是「数字 + 已完成」无加号
+    if (!st.done && !ptsRe.test(cardText)) continue;
+    if (st.done && ptsRe.test(cardText)) continue; // 完成卡不应再带 +分
+
+    let href = '';
+    if (a.tagName === 'A') href = a.href || '';
+    else {
+      const link = card.querySelector && card.querySelector('a[href]');
+      if (link) href = link.href || '';
+    }
+    const titleGuess = cardText
+      .replace(/[+＋]\\s*\\d+/g, ' ')
+      .replace(/\\d+\\s*(已完成|已领取)/g, ' ')
+      .replace(/\\b已完成\\b/g, ' ')
+      .replace(/\\bcompleted\\b/ig, ' ')
+      .replace(/\\b已领取\\b/g, ' ')
+      .replace(/\\b已激活\\b/g, ' ')
+      .replace(/\\d+\\s*积分/g, ' ')
+      .replace(/需要[^\\s]{0,6}级别/g, ' ')
+      .trim()
+      .slice(0, 80);
+    if (!titleGuess) continue;
+    // 打卡/促销大卡过滤（非整张日常卡）
+    if (/(个任务|连续打卡|开始使用 Rewards|Discord|Spotify)/i.test(cardText) && plusCount <= 1 && /\\d+\\/\\d+/.test(cardText)) {
+      continue;
+    }
+    const key = ((href || '').split('#')[0] + '|' + titleGuess).toLowerCase().slice(0, 140);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push({
+      href: href || '',
+      text: titleGuess,
+      nearby: cardText.slice(0, 280),
+      section: matchedTitle,
+      titleGuess,
+      status: st.done ? 'completed' : 'pending',
+      pointsLabel: st.plus || '',
+    });
+  }
+  items.sort((a, b) => (a.nearby || '').length - (b.nearby || '').length);
+  return items;
+}"""
 
 
 async def collect_section_point_offers(
@@ -236,13 +522,18 @@ async def collect_section_point_offers(
     *,
     section_titles: list[str],
     next_section_pattern: str,
+    root_selector: Optional[str] = None,
+    include_completed: bool = False,
 ) -> list[dict]:
-    """收集指定分区标题下带 +积分 的任务卡片。"""
+    """收集指定分区下的任务卡片。
+
+    真实 DOM：待做卡带「+N」徽章；完成卡为「N 已完成」（无加号，右侧文案「已完成」）。
+    """
     try:
         await page.evaluate(
             """(titles) => {
               const norm = (s) => (s || '').trim().replace(/\\s+/g, ' ');
-              for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p')) {
+              for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p,#dailyset')) {
                 const own = norm(el.innerText || '');
                 if (!own || own.length > 40) continue;
                 if ((titles || []).some((t) => own === t || own.startsWith(t))) {
@@ -258,237 +549,14 @@ async def collect_section_point_offers(
         pass
 
     offers = await page.evaluate(
-        """({ titles, nextSectionPattern, relaxBounds }) => {
-          const norm = (s) => (s || '').trim().replace(/\\s+/g, ' ');
-          const yOf = (el) => {
-            try {
-              const r = el.getBoundingClientRect();
-              return r.top + window.scrollY;
-            } catch (e) {
-              return 0;
-            }
-          };
-          // 半角/全角加号
-          const ptsRe = /[+＋]\\s*\\d+/;
-          const titleSet = (titles || []).map((t) => norm(t)).filter(Boolean);
-          if (!titleSet.length) return [];
-
-          let heading = null;
-          let matchedTitle = '';
-          const candidates = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p'));
-          for (const el of candidates) {
-            const own = norm(el.innerText || '');
-            if (!own || own.length > 40) continue;
-            for (const t of titleSet) {
-              if (own === t || (own.startsWith(t) && own.length <= t.length + 10)) {
-                heading = el;
-                matchedTitle = t;
-                break;
-              }
-            }
-            if (heading) break;
-          }
-          if (!heading) return [];
-
-          // 标题节点取「短文本」那一层的 Y，避免误用整块容器
-          const headingY = yOf(heading);
-          let nextSectionRe;
-          try {
-            nextSectionRe = new RegExp(nextSectionPattern, 'i');
-          } catch (e) {
-            nextSectionRe = /^(更多活动|探索|游戏|必应搜索|邀请)/i;
-          }
-          let nextY = Infinity;
-          if (!relaxBounds) {
-            for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p')) {
-              const own = norm(el.innerText || '');
-              if (!own || own.length > 36) continue;
-              if (titleSet.some((t) => own === t || own.startsWith(t))) continue;
-              if (!nextSectionRe.test(own)) continue;
-              const y = yOf(el);
-              if (y > headingY + 30 && y < nextY) nextY = y;
-            }
-          }
-          // 下界过近时放宽，避免标题下一行小字把卡片全裁掉
-          if (!relaxBounds && nextY - headingY < 120) nextY = headingY + 2200;
-          if (relaxBounds) nextY = headingY + 3200;
-
-          const items = [];
-          const seen = new Set();
-
-          // 从「+分」徽章向上找卡片（标题与 +10 常在不同节点，单节点匹配会漏）
-          const badgeNodes = [];
-          for (const el of document.querySelectorAll('span, div, p, a, button, li, em, strong, label')) {
-            const raw = norm(el.innerText || '');
-            // 只要短文本里的 +分，避免整页大容器
-            if (!raw || raw.length > 24) continue;
-            if (!ptsRe.test(raw) && !/^\\d+\\s*积分$/.test(raw)) continue;
-            const y = yOf(el);
-            // 允许与标题同一行/稍上方（横滑卡片）
-            if (y < headingY - 60) continue;
-            if (y >= nextY) continue;
-            badgeNodes.push(el);
-          }
-
-          for (const badge of badgeNodes) {
-            let scope = badge;
-            let cardText = norm(scope.innerText || '');
-            for (let i = 0; i < 10; i++) {
-              const p = scope.parentElement;
-              if (!p || p === document.body || p === document.documentElement) break;
-              const pt = norm(p.innerText || '');
-              const py = yOf(p);
-              if (py < headingY - 80) break;
-              if (py >= nextY) break;
-              if (titleSet.some((t) => pt === t || pt.startsWith(t + ' ') || pt.startsWith(t))) break;
-              // 扩展到含标题的卡片：有加分且有一定文案，且别吞掉整分区
-              if (pt.length > 420) break;
-              if (ptsRe.test(pt) || /\\d+\\s*积分/.test(pt)) {
-                scope = p;
-                cardText = pt;
-                // 已经像一张卡（标题+描述+分）就停
-                if (pt.length >= 12 && pt.length <= 320) {
-                  // 若再上一层明显变成多卡集合，停止
-                  const pp = p.parentElement;
-                  if (pp) {
-                    const ppt = norm(pp.innerText || '');
-                    const plusCount = (ppt.match(/[+＋]\\s*\\d+/g) || []).length;
-                    if (plusCount >= 3 && ppt.length > pt.length * 1.8) break;
-                  }
-                }
-              } else {
-                break;
-              }
-            }
-
-            cardText = norm(cardText).slice(0, 280);
-            if (cardText.length < 4) continue;
-            if (!ptsRe.test(cardText) && !/\\d+\\s*积分/.test(cardText)) continue;
-            if (/(已完成|completed|已领取)/i.test(cardText) && !ptsRe.test(cardText)) continue;
-
-            let href = '';
-            const link = (scope.closest && scope.closest('a[href]')) ||
-              (scope.tagName === 'A' ? scope : null) ||
-              (scope.querySelector && scope.querySelector('a[href]'));
-            if (link) href = link.href || link.getAttribute('href') || '';
-
-            const titleGuess = cardText
-              .replace(/[+＋]\\s*\\d+/g, ' ')
-              .replace(/\\d+\\s*积分/g, ' ')
-              .replace(/需要[^\\s]{0,6}级别/g, ' ')
-              .trim()
-              .slice(0, 80);
-
-            const key = (titleGuess || cardText).toLowerCase().slice(0, 100);
-            if (!key || seen.has(key)) continue;
-            seen.add(key);
-
-            items.push({
-              href: href || '',
-              text: titleGuess || cardText.slice(0, 80),
-              nearby: cardText,
-              section: matchedTitle,
-              titleGuess: titleGuess || cardText.slice(0, 80),
-            });
-          }
-
-          // 若徽章法仍为空：放宽为分区内任意含 +分 的中等容器
-          if (!items.length) {
-            for (const el of document.querySelectorAll('a, button, [role="link"], div, li, article')) {
-              const y = yOf(el);
-              if (y < headingY - 60 || y >= nextY) continue;
-              const t = norm(el.innerText || '');
-              if (t.length < 8 || t.length > 360) continue;
-              if (!ptsRe.test(t)) continue;
-              if (titleSet.some((x) => t.startsWith(x))) continue;
-              const plusCount = (t.match(/[+＋]\\s*\\d+/g) || []).length;
-              if (plusCount !== 1) continue; // 只要单卡
-              const titleGuess = t.replace(/[+＋]\\s*\\d+/g, ' ').trim().slice(0, 80);
-              const key = titleGuess.toLowerCase().slice(0, 100);
-              if (!key || seen.has(key)) continue;
-              seen.add(key);
-              let href = '';
-              const link = el.tagName === 'A' ? el : (el.querySelector && el.querySelector('a[href]'));
-              if (link) href = link.href || '';
-              items.push({
-                href: href || '',
-                text: titleGuess,
-                nearby: t.slice(0, 280),
-                section: matchedTitle,
-                titleGuess,
-              });
-            }
-          }
-
-          items.sort((a, b) => (a.nearby || '').length - (b.nearby || '').length);
-          return items;
-        }""",
+        _COLLECT_SECTION_JS,
         {
             "titles": section_titles,
             "nextSectionPattern": next_section_pattern,
-            "relaxBounds": False,
+            "rootSelector": root_selector,
+            "includeCompleted": include_completed,
         },
     )
-    if not offers:
-        offers = await page.evaluate(
-            """({ titles, nextSectionPattern, relaxBounds }) => {
-              const norm = (s) => (s || '').trim().replace(/\\s+/g, ' ');
-              const yOf = (el) => {
-                try { return el.getBoundingClientRect().top + window.scrollY; }
-                catch (e) { return 0; }
-              };
-              const ptsRe = /[+＋]\\s*\\d+/;
-              const titleSet = (titles || []).map((t) => norm(t)).filter(Boolean);
-              let heading = null;
-              let matchedTitle = '';
-              for (const el of document.querySelectorAll('h1,h2,h3,h4,h5,h6,div,span,p')) {
-                const own = norm(el.innerText || '');
-                if (!own || own.length > 40) continue;
-                for (const t of titleSet) {
-                  if (own === t || (own.startsWith(t) && own.length <= t.length + 10)) {
-                    heading = el; matchedTitle = t; break;
-                  }
-                }
-                if (heading) break;
-              }
-              if (!heading) return [];
-              const headingY = yOf(heading);
-              const nextY = headingY + 3200;
-              const items = [];
-              const seen = new Set();
-              for (const el of document.querySelectorAll('a, button, [role="link"], div, li, article')) {
-                const y = yOf(el);
-                if (y < headingY - 60 || y >= nextY) continue;
-                const t = norm(el.innerText || '');
-                if (t.length < 8 || t.length > 360) continue;
-                if (!ptsRe.test(t)) continue;
-                if (titleSet.some((x) => t.startsWith(x))) continue;
-                const plusCount = (t.match(/[+＋]\\s*\\d+/g) || []).length;
-                if (plusCount < 1 || plusCount > 2) continue;
-                const titleGuess = t.replace(/[+＋]\\s*\\d+/g, ' ').trim().slice(0, 80);
-                const key = titleGuess.toLowerCase().slice(0, 100);
-                if (!key || seen.has(key)) continue;
-                seen.add(key);
-                let href = '';
-                const link = el.tagName === 'A' ? el : (el.querySelector && el.querySelector('a[href]'));
-                if (link) href = link.href || '';
-                items.push({
-                  href: href || '',
-                  text: titleGuess,
-                  nearby: t.slice(0, 280),
-                  section: matchedTitle,
-                  titleGuess,
-                });
-              }
-              items.sort((a, b) => (a.nearby || '').length - (b.nearby || '').length);
-              return items;
-            }""",
-            {
-                "titles": section_titles,
-                "nextSectionPattern": next_section_pattern,
-                "relaxBounds": True,
-            },
-        )
 
     out = []
     seen = set()
@@ -497,20 +565,24 @@ async def collect_section_point_offers(
         href = (o.get("href") or "").strip()
         text = (o.get("text") or "").strip()
         nearby = (o.get("nearby") or text).strip()
-        if not re.search(r"[+＋]\s*\d+", nearby or text) and not re.search(r"(\d+)\s*积分", nearby or text):
-            continue
+        status = (o.get("status") or "pending").strip()
+        if status != "completed":
+            if not re.search(r"[+＋]\s*\d+", nearby or text) and not re.search(r"(\d+)\s*积分", nearby or text):
+                continue
+            # 完成文案优先：出现「已完成」且无 +分 → 不当待做
+            if re.search(r"(已完成|completed|已领取)", nearby, re.I) and not re.search(r"[+＋]\s*\d+", nearby):
+                filtered_skip += 1
+                continue
         if _is_skip_offer_text(text, nearby):
             filtered_skip += 1
             continue
         if href and _is_skip_href(href):
-            # 仍保留可按标题点击的卡片（清空 href）
             href = ""
         key = (href.split("#")[0].lower() if href else "") or f"text:{(nearby or text)[:80].lower()}"
         if key in seen:
             continue
         seen.add(key)
         label = (o.get("titleGuess") or text or nearby)[:120]
-        # 点击文案：优先完整标题前 20 字，避免只点到「即将」等过短片段
         click = label[:24].strip()
         if "完成此拼图" in (nearby or text):
             click = "完成此拼图"
@@ -522,6 +594,8 @@ async def collect_section_point_offers(
                 "section": o.get("section") or "",
                 "is_puzzle": _is_puzzle_offer(href, f"{text} {nearby}"),
                 "click_text": click,
+                "status": status,
+                "points_label": o.get("pointsLabel") or "",
             }
         )
 
@@ -540,42 +614,51 @@ async def collect_section_point_offers(
     return out
 
 
-async def collect_homepage_daily_set(page: Page) -> list[dict]:
+async def collect_homepage_daily_set(page: Page, *, include_completed: bool = False) -> list[dict]:
     """首页「每日活动」(#dailyset) 分区卡片。
 
-    实测：分区默认折叠，折叠时页面只有「每日活动 5」标题、无 +分卡；
-    展开后才出现 3 张每日卡。另有「完成每日任务集」入口会跳到 ?section=dailyset。
+    实测：分区默认折叠；完成卡文案为「N 已完成」（无 +）；待做卡为「+N」。
     """
     await _expand_homepage_dailyset(page)
     next_pat = (
         r"^(日常任务|更多活动|探索|游戏|必应搜索|邀请|抽奖|购物|连续打卡|"
         r"More activities|Earn|Redeem|Punch cards|开始使用)"
     )
-    title_groups = [
+    # 优先用 #dailyset，避免扫到印章/连续打卡的 +500
+    last = await collect_section_point_offers(
+        page,
+        section_titles=["每日活动", "Daily activities", "Daily set"],
+        next_section_pattern=next_pat,
+        root_selector="#dailyset",
+        include_completed=include_completed,
+    )
+    if last:
+        return last
+    for titles in (
         ["每日活动", "Daily activities", "Daily Activities", "Daily set", "Daily Set"],
         ["每日任务", "Daily tasks"],
-    ]
-    last: list[dict] = []
-    for titles in title_groups:
+    ):
         last = await collect_section_point_offers(
             page,
             section_titles=titles,
             next_section_pattern=next_pat,
+            include_completed=include_completed,
         )
         if last:
             return last
     return last
 
 
-async def collect_earn_offers(page: Page) -> list[dict]:
-    """积分赚取页「日常任务」分区里带 +积分 的卡片。"""
+async def collect_earn_offers(page: Page, *, include_completed: bool = False) -> list[dict]:
+    """积分赚取页「日常任务」分区卡片（待做=+N，完成=已完成）。"""
     return await collect_section_point_offers(
         page,
         section_titles=["日常任务"],
         next_section_pattern=(
-            r"^(每日任务|每日活动|更多活动|探索|游戏|必应搜索|邀请|抽奖|购物|"
-            r"Redeem|More activities|Daily activities|Daily set)"
+            r"^(每日任务|每日活动|更多活动|探索|游戏|必应搜索|邀请|抽奖|购物|升级活动|"
+            r"Redeem|More activities|Daily activities|Daily set|连续打卡)"
         ),
+        include_completed=include_completed,
     )
 
 
@@ -674,10 +757,25 @@ async def claim_available_rewards(
 
 
 def _offer_key(offer: dict) -> str:
-    href = (offer.get("href") or "").strip()
+    """活动去重键。checkuser 等跳转链会被多卡共用，必须以标题区分。"""
+    href = (offer.get("href") or "").strip().split("#")[0].lower()
+    title = (offer.get("text") or offer.get("titleGuess") or offer.get("click_text") or "").strip().lower()
+    title = re.sub(r"\s+", " ", title)[:48]
+    shared = (not href) or any(
+        x in href
+        for x in (
+            "rewards/checkuser",
+            "bing.com/search?",
+            "bing.com/rewards/redeem",
+        )
+    )
+    if title and (shared or not href):
+        return f"title:{title}"
+    if href and title:
+        return f"{href}|{title[:24]}"
     if href:
-        return href.split("#")[0].lower()
-    near = (offer.get("nearby") or offer.get("text") or "").strip().lower()
+        return href
+    near = (offer.get("nearby") or "").strip().lower()
     return f"text:{near[:80]}"
 
 
@@ -739,6 +837,161 @@ async def _open_offer_card(page: Page, context: BrowserContext, offer: dict) -> 
         return page
 
 
+async def _reload_offer_list(page: Page, list_url: str) -> Page:
+    try:
+        if list_url.rstrip("/") not in (page.url or ""):
+            await page.goto(list_url, wait_until=DOMCONTENTLOADED, timeout=60000)
+        else:
+            await page.reload(wait_until=DOMCONTENTLOADED, timeout=60000)
+        await page.wait_for_timeout(1500)
+    except Exception:
+        pass
+    return page
+
+
+async def _execute_one_offer(
+    page: Page,
+    context: BrowserContext,
+    offer: dict,
+    *,
+    list_url: str,
+    label: str,
+    log: Optional[LogFn] = None,
+) -> Page:
+    """打开并操作单个活动，然后回到列表页。"""
+    href = (offer.get("href") or "").strip()
+    title = (offer.get("text") or "")[:60]
+    hint = f"{offer.get('text', '')} {offer.get('nearby', '')}"
+    is_puzzle = bool(offer.get("is_puzzle"))
+    kind = "拼图(仅打开)" if is_puzzle else label
+
+    page = await _close_extra_pages(context, page)
+    list_page = page
+
+    activity_page = await _open_offer_card(page, context, offer)
+    try:
+        await activity_page.wait_for_load_state(DOMCONTENTLOADED, timeout=30000)
+    except Exception:
+        pass
+
+    try:
+        if (
+            href
+            and activity_page == list_page
+            and "rewards.bing.com" in (activity_page.url or "")
+            and href.lower() not in (activity_page.url or "").lower()
+        ):
+            await activity_page.goto(href, wait_until=DOMCONTENTLOADED, timeout=45000)
+    except Exception:
+        pass
+
+    try:
+        how = await _complete_activity_page(
+            activity_page,
+            offer_hint=hint,
+            open_only=is_puzzle,
+        )
+        _log(log, f"{label}已操作 ({how}): {title}")
+    except Exception as e:
+        _log(log, f"{label}异常: {e}")
+
+    try:
+        if activity_page != list_page and not activity_page.is_closed():
+            await activity_page.close()
+    except Exception:
+        pass
+
+    page = await _latest_page(context, list_page if not list_page.is_closed() else page)
+    page = await _reload_offer_list(page, list_url)
+    # 积分状态有时延迟刷新，稍等再复核
+    await _sleep(1800, 2800)
+    return page
+
+
+async def _check_offer_completion(page: Page, offer: dict) -> dict:
+    """抓取同一活动卡片状态：以状态节点「已完成」为准（完成卡是「N 已完成」，无 +）。"""
+    href = (offer.get("href") or "").strip()
+    title = (offer.get("text") or offer.get("click_text") or "").strip()[:48]
+    title_key = title[:16].strip()
+    try:
+        info = await page.evaluate(
+            """({ href, title, titleKey }) => {
+              const norm = (s) => (s || '').trim().replace(/\\s+/g, ' ');
+              const ptsRe = /[+＋]\\s*\\d+/;
+              const doneExact = /^(已完成|completed|已领取)$/i;
+              let best = null;
+              const sharedHref = !href || /rewards\\/checkuser|bing\\.com\\/search\\?/i.test(href);
+              for (const a of document.querySelectorAll('a[href], button, [role="link"]')) {
+                const h = ((a.href || a.getAttribute('href') || '') + '').split('#')[0];
+                const aText = norm(a.innerText || a.getAttribute('aria-label') || '');
+                let score = 0;
+                // 共用 checkuser 时标题权重更高，避免串到别的卡
+                if (titleKey && (aText.includes(titleKey) || norm((a.closest('div')||{}).innerText||'').includes(titleKey))) score += sharedHref ? 10 : 5;
+                if (title && aText.includes(title.slice(0, 10))) score += 3;
+                if (!sharedHref && href && h && (h === href || (href.length > 12 && h.includes(href.slice(0, 48))))) score += 8;
+                if (score < 5) continue;
+                // 收束到单卡
+                let card = a;
+                for (let i = 0; i < 8; i++) {
+                  const p = card.parentElement;
+                  if (!p || p === document.body) break;
+                  const pt = norm(p.innerText || '');
+                  if (pt.length > 260) break;
+                  const plusCount = (pt.match(/[+＋]\\s*\\d+/g) || []).length;
+                  const doneCount = (pt.match(/已完成|completed|已领取/gi) || []).length;
+                  if (plusCount + doneCount >= 3) break;
+                  card = p;
+                  if ((ptsRe.test(pt) || doneCount) && pt.length <= 220) break;
+                }
+                const ct = norm(card.innerText || '');
+                let hasDoneLabel = false;
+                let hasPlus = false;
+                for (const s of card.querySelectorAll('div,span,p,em,strong')) {
+                  const st = norm(s.innerText || '');
+                  if (!st || st.length > 18) continue;
+                  if (doneExact.test(st)) hasDoneLabel = true;
+                  if (/^[+＋]\\s*\\d+$/.test(st)) hasPlus = true;
+                }
+                if (!hasPlus) hasPlus = ptsRe.test(ct);
+                if (!hasDoneLabel) hasDoneLabel = /(^|\\s)(已完成|completed|已领取)(\\s|$)/i.test(ct) && !hasPlus;
+                const cand = { score, text: ct.slice(0, 180), hasPlus, hasDoneLabel, len: ct.length };
+                if (!best || cand.score > best.score || (cand.score === best.score && cand.len < best.len)) best = cand;
+              }
+              if (!best) return { found: false, hasPlus: false, hasDoneLabel: false, text: '' };
+              return { found: true, hasPlus: !!best.hasPlus, hasDoneLabel: !!best.hasDoneLabel, text: best.text };
+            }""",
+            {"href": href, "title": title, "titleKey": title_key},
+        )
+    except Exception as e:
+        return {"done": False, "reason": f"状态抓取失败: {e}", "has_plus": False, "has_done_label": False}
+
+    if not info or not info.get("found"):
+        return {"done": True, "reason": "卡片已消失", "has_plus": False, "has_done_label": False}
+
+    has_done = bool(info.get("hasDoneLabel"))
+    has_plus = bool(info.get("hasPlus"))
+    if has_done and not has_plus:
+        return {"done": True, "reason": "卡片显示已完成", "has_plus": False, "has_done_label": True}
+    if has_plus:
+        return {
+            "done": False,
+            "reason": "有已完成文案但仍带+分" if has_done else "卡片仍带+分",
+            "has_plus": True,
+            "has_done_label": has_done,
+        }
+    return {"done": True, "reason": "卡片不再带+分", "has_plus": False, "has_done_label": has_done}
+
+
+async def _offer_still_pending(collect_fn: Callable[[Page], Awaitable[list]], page: Page, offer: dict) -> bool:
+    """未完成：状态节点不是「已完成」，且待做列表仍能扫到同 key。"""
+    status = await _check_offer_completion(page, offer)
+    if status.get("done"):
+        return False
+    key = _offer_key(offer)
+    remaining = await collect_fn(page)
+    return any(_offer_key(o) == key for o in remaining)
+
+
 async def _run_point_offers(
     page: Page,
     context: BrowserContext,
@@ -749,8 +1002,13 @@ async def _run_point_offers(
     log: Optional[LogFn] = None,
     should_stop: Optional[StopFn] = None,
     max_offers: int = 16,
+    max_retries_per_offer: int = 3,
 ) -> tuple[Page, int]:
-    """在指定列表页收集并完成带积分任务。返回 (page, 完成数)。"""
+    """收集并完成带积分任务。
+
+    完成检测：刷新后抓同一卡片，优先识别「已完成/completed/已领取」；
+    若仍带 +分 则立刻重做该活动。首页每日活动与赚取页日常任务共用。
+    """
     if _stopped(should_stop):
         return page, 0
 
@@ -762,15 +1020,16 @@ async def _run_point_offers(
         _log(log, f"打开{label}页面失败: {e}")
         return page, 0
 
-    done = 0
-    attempted: set[str] = set()
+    verified = 0
+    hard_fail: set[str] = set()
+    seen_keys: set[str] = set()
 
-    for round_idx in range(1, 3):
-        if _stopped(should_stop) or done >= max_offers:
+    for round_idx in range(1, 5):
+        if _stopped(should_stop) or verified >= max_offers:
             break
 
         offers = await collect_fn(page)
-        pending = [o for o in offers if _offer_key(o) not in attempted]
+        pending = [o for o in offers if _offer_key(o) not in hard_fail]
         _log(log, f"{label} 第 {round_idx} 轮发现 {len(pending)} 个（候选 {len(offers)}）")
         if not pending:
             if round_idx == 1:
@@ -800,86 +1059,85 @@ async def _run_point_offers(
                     pass
             break
 
+        progressed = False
         for offer in pending:
-            if _stopped(should_stop) or done >= max_offers:
+            if _stopped(should_stop) or verified >= max_offers:
                 break
 
             key = _offer_key(offer)
-            if key in attempted:
-                continue
-            attempted.add(key)
-
-            href = (offer.get("href") or "").strip()
             title = (offer.get("text") or "")[:60]
-            hint = f"{offer.get('text', '')} {offer.get('nearby', '')}"
-            is_puzzle = bool(offer.get("is_puzzle"))
-            kind = "拼图(仅打开)" if is_puzzle else label
-            _log(log, f"处理{kind}: {title}")
+            current = offer
+            ok = False
 
-            page = await _close_extra_pages(context, page)
-            before = list(context.pages)
-            list_page = page
-
-            try:
-                activity_page = await _open_offer_card(page, context, offer)
-            except Exception as e:
-                _log(log, f"打开{label}失败: {e}")
-                try:
-                    await page.goto(list_url, wait_until=DOMCONTENTLOADED, timeout=60000)
-                except Exception:
-                    pass
-                continue
-
-            try:
-                await activity_page.wait_for_load_state(DOMCONTENTLOADED, timeout=30000)
-            except Exception:
-                pass
-
-            try:
-                if (
-                    href
-                    and activity_page == list_page
-                    and "rewards.bing.com" in (activity_page.url or "")
-                    and href.lower() not in (activity_page.url or "").lower()
-                ):
-                    await activity_page.goto(href, wait_until=DOMCONTENTLOADED, timeout=45000)
-            except Exception:
-                pass
-
-            try:
-                how = await _complete_activity_page(
-                    activity_page,
-                    offer_hint=hint,
-                    open_only=is_puzzle,
+            for attempt in range(1, max_retries_per_offer + 1):
+                if _stopped(should_stop):
+                    break
+                _log(
+                    log,
+                    f"处理{label}: {title}"
+                    + (f"（第 {attempt}/{max_retries_per_offer} 次）" if attempt > 1 else ""),
                 )
-                _log(log, f"{label}完成 ({how}): {title}")
-                done += 1
-            except Exception as e:
-                _log(log, f"{label}异常: {e}")
+                try:
+                    page = await _execute_one_offer(
+                        page,
+                        context,
+                        current,
+                        list_url=list_url,
+                        label=label,
+                        log=log,
+                    )
+                except Exception as e:
+                    _log(log, f"打开/执行{label}失败: {e}")
+                    page = await _reload_offer_list(page, list_url)
+                    # 刷新后用最新卡片再试
+                    refreshed = await collect_fn(page)
+                    current = next((o for o in refreshed if _offer_key(o) == key), current)
+                    continue
 
-            try:
-                if activity_page != list_page and not activity_page.is_closed():
-                    await activity_page.close()
-            except Exception:
-                pass
-
-            page = await _latest_page(context, list_page if not list_page.is_closed() else page)
-            try:
-                if list_url.rstrip("/") not in (page.url or ""):
-                    await page.goto(list_url, wait_until=DOMCONTENTLOADED, timeout=60000)
+                # 完成检测：优先看卡片「已完成/completed」，否则看是否还带 +分
+                status = await _check_offer_completion(page, current)
+                still = await _offer_still_pending(collect_fn, page, current)
+                if status.get("done") and not still:
+                    verified += 1
+                    progressed = True
+                    ok = True
+                    _log(log, f"{label}复核通过（{status.get('reason')}）: {title}")
+                    break
+                if status.get("done") and still:
+                    # 状态文案像完成，但收集器仍扫到 +分 → 以 +分为准重做
+                    _log(log, f"{label}状态冲突（{status.get('reason')}，收集器仍见+分）: {title}")
                 else:
-                    await page.reload(wait_until=DOMCONTENTLOADED, timeout=60000)
-                await page.wait_for_timeout(1200)
-            except Exception:
-                pass
+                    _log(log, f"{label}复核未通过（{status.get('reason')}）: {title}")
 
-            await _sleep(800, 1800)
+                refreshed = await collect_fn(page)
+                current = next((o for o in refreshed if _offer_key(o) == key), current)
+                if attempt < max_retries_per_offer:
+                    _log(log, f"{label}立即重做: {title}")
+                    await _sleep(600, 1200)
 
-            if len(context.pages) > len(before) + 1:
-                page = await _close_extra_pages(context, page)
+            if not ok:
+                hard_fail.add(key)
+                _log(log, f"{label}复核失败已达 {max_retries_per_offer} 次，跳过: {title}")
+            seen_keys.add(key)
+            page = await _close_extra_pages(context, page)
 
-    _log(log, f"{label}结束，尝试完成 {done} 个")
-    return page, done
+        if not progressed:
+            left = [o for o in await collect_fn(page) if _offer_key(o) not in hard_fail]
+            if not left:
+                break
+            # 本轮全是已见过且仍失败的，结束避免空转
+            if all(_offer_key(o) in seen_keys for o in left) and round_idx >= 2:
+                titles = ", ".join((o.get("text") or "")[:24] for o in left[:5])
+                _log(log, f"{label}仍有 {len(left)} 个未通过: {titles}")
+                break
+
+    page = await _reload_offer_list(page, list_url)
+    all_left = await collect_fn(page)
+    if all_left:
+        titles = ", ".join((o.get("text") or "")[:24] for o in all_left[:5])
+        _log(log, f"{label}结束仍剩 {len(all_left)} 个带 +分: {titles}")
+    _log(log, f"{label}结束，复核通过 {verified} 个")
+    return page, verified
 
 
 async def complete_daily_activities(
