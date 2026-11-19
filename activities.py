@@ -73,10 +73,8 @@ def _is_skip_href(href: str) -> bool:
     # 空链接/页内锚点：靠文案点击，不在这里拦截
     if not href_l or href_l.startswith(("javascript:", "mailto:", "#")):
         return False
+    # 注意：referandearn /refer 是每日「将推荐转化为奖励」urlreward，点开即完成，勿跳过
     skip_bits = (
-        "referandearn",
-        "refer?",
-        "/refer",
         "wallpaper",
         "autodownload",
         "xbox.com",
@@ -100,10 +98,29 @@ def _is_skip_href(href: str) -> bool:
     return any(b in href_l for b in skip_bits)
 
 
+def _is_refer_offer(href: str = "", *text_parts: str) -> bool:
+    """每日推荐/邀请 urlreward：打开 refer 页即可记账，无需真的拉好友。"""
+    blob = " ".join([href or "", *[p for p in text_parts if p]]).lower()
+    return any(
+        k in blob
+        for k in (
+            "referandearn",
+            "rewards.bing.com/refer",
+            "将推荐转化为奖励",
+            "推荐转化为奖励",
+            "refer and earn",
+            "refer a friend",
+        )
+    )
+
+
 def _is_skip_offer_text(*parts: str) -> bool:
-    """过滤下载应用、等级门槛、邀请等无效「任务」。"""
+    """过滤下载应用、等级门槛等无效「任务」（不含可点开完成的推荐卡）。"""
     blob = " ".join(p for p in parts if p)
     if not blob:
+        return False
+    # 可自动完成的推荐 urlreward 不拦截
+    if _is_refer_offer("", blob):
         return False
     skip_words = (
         "立即下载",
@@ -285,6 +302,17 @@ async def _complete_activity_page(page: Page, *, offer_hint: str = "", open_only
         await page.wait_for_timeout(random.randint(1800, 3200))
         return "opened_puzzle" if _is_puzzle_offer(url, hint) else "opened_only"
 
+    # 推荐/邀请 urlreward：打开 refer 页停留即可（不必真分享）
+    if _is_refer_offer(url, hint):
+        try:
+            for _ in range(2):
+                await page.mouse.wheel(0, random.randint(400, 900))
+                await page.wait_for_timeout(random.randint(700, 1200))
+        except Exception:
+            pass
+        await page.wait_for_timeout(random.randint(4500, 7500))
+        return "refer_opened_dwell"
+
     try:
         body_snip = ((await page.locator("body").inner_text(timeout=2000)) or "")[:1200]
     except Exception:
@@ -292,6 +320,15 @@ async def _complete_activity_page(page: Page, *, offer_hint: str = "", open_only
     if _is_puzzle_offer(url, body_snip) or ("拼图" in body_snip and "排列图块" in body_snip):
         await page.wait_for_timeout(random.randint(1800, 3200))
         return "opened_puzzle"
+    if _is_refer_offer(url, hint, body_snip):
+        try:
+            for _ in range(2):
+                await page.mouse.wheel(0, random.randint(400, 900))
+                await page.wait_for_timeout(random.randint(700, 1200))
+        except Exception:
+            pass
+        await page.wait_for_timeout(random.randint(4500, 7500))
+        return "refer_opened_dwell"
 
     cur = (page.url or "").lower()
     is_search_landing = "bing.com" in cur and ("/search?" in cur or ("q=" in cur and "/search" in cur))
@@ -658,8 +695,10 @@ async def collect_section_point_offers(
         if _is_skip_offer_text(text, nearby):
             filtered_skip += 1
             continue
+        # 邀请/商店等链接不是可自动完成的每日卡：整卡跳过（勿只清空 href 仍当待做）
         if href and _is_skip_href(href):
-            href = ""
+            filtered_skip += 1
+            continue
         key = (href.split("#")[0].lower() if href else "") or f"text:{(nearby or text)[:80].lower()}"
         if key in seen:
             continue
@@ -1112,9 +1151,11 @@ async def _open_offer_card(
     """
     href = (offer.get("href") or "").strip()
     tour = _offer_is_tour(offer)
+    refer = _is_refer_offer(href, offer.get("text") or "", offer.get("nearby") or "")
 
     page = await _close_extra_pages(context, page)
     before_pages = list(context.pages)
+    list_url_before = page.url or ""
     await _clear_click_blockers(page)
 
     loc = await _resolve_offer_locator(page, offer)
@@ -1131,9 +1172,13 @@ async def _open_offer_card(
         async def _opened() -> bool:
             if any(p not in before_pages and not p.is_closed() for p in context.pages):
                 return True
-            cur = page.url or ""
+            cur = (page.url or "").lower()
             if href and "rewards.bing.com" not in cur and ("bing.com/search" in cur or "bing.com/" in cur):
                 return True
+            # 同站跳到 refer / 活动落地
+            if cur and cur != (list_url_before or "").lower():
+                if "refer" in cur or (href and href.split("?")[0].lower() in cur):
+                    return True
             expected_q = _offer_search_query(href)
             if expected_q and expected_q in unquote(cur):
                 return True
@@ -1158,10 +1203,10 @@ async def _open_offer_card(
         async def _try_js_anchor() -> None:
             await _js_click_offer_anchor(page, href)
 
-        # 顺序：拟人 → 校验；失败再 force → JS <a>.click（观光卡关键）
+        # 顺序：拟人 → 校验；失败再 force → JS <a>.click（观光/推荐卡优先 DOM）
         attempts = (_try_human, _try_force_locator, _try_js_anchor)
-        if tour:
-            # 观光卡优先 DOM click，避免遮罩吞鼠标后又 goto 丢归因
+        if tour or refer:
+            # 遮罩易吞鼠标；推荐卡同站跳转也优先真实 <a>.click
             attempts = (_try_js_anchor, _try_force_locator, _try_human)
 
         for attempt in attempts:
